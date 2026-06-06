@@ -29,15 +29,15 @@ jobs:
           test -d "$XCODE_SDK" || { echo "FATAL: SDK not found"; exit 1; }
           mkdir -p "$THEOS/sdks"
           ditto "$XCODE_SDK" "$THEOS/sdks/iPhoneOS18.4.sdk"
-          echo "SDK copied: $(ls $THEOS/sdks/iPhoneOS18.4.sdk | head -3)"
+          echo "SDK copied"
       
-      - name: Link fishhook (from Theos submodule, with subdir)
+      - name: Install fishhook into project
         run: |
           mkdir -p $THEOS/include/fishhook
           cp $THEOS/vendor/orion/fishhook/fishhook.h $THEOS/include/fishhook/
-          cp $THEOS/vendor/orion/fishhook/fishhook.c $THEOS/lib/
-          echo "fishhook installed"
-          ls -la $THEOS/include/fishhook/
+          cp $THEOS/vendor/orion/fishhook/fishhook.c tweak/
+          echo "fishhook.c copied to tweak directory"
+          ls -la tweak/fishhook.c
       
       - name: Build dylib
         run: |
