@@ -1,0 +1,38 @@
+name: Build WinwalkHook Dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Theos
+        run: |
+          export THEOS=/Users/runner/theos
+          echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+      
+      - name: Install fishhook
+        run: |
+          curl -L https://github.com/facebook/fishhook/archive/refs/tags/v0.2.tar.gz -o fishhook.tar.gz
+          tar xzf fishhook.tar.gz
+          cp fishhook-0.2/fishhook.h $THEOS/include/
+          cp fishhook-0.2/fishhook.c $THEOS/lib/
+      
+      - name: Build dylib
+        run: |
+          cd tweak
+          export THEOS=/Users/runner/theos
+          make clean
+          make
+      
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinwalkHook.dylib
+          path: tweak/WinwalkHook.dylib
