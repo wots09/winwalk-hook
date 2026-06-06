@@ -1,4 +1,4 @@
-name: Build WinwalkHook Dylib
+name: Build WinwalkHook V2
 
 on:
   push:
@@ -19,19 +19,16 @@ jobs:
         run: |
           export THEOS=/Users/runner/theos
           echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
-          git clone --depth 1 --recursive \
-            https://github.com/theos/theos.git $THEOS
+          git clone --depth 1 --recursive https://github.com/theos/theos.git $THEOS
           brew install ldid
       
       - name: Install iOS SDK from Xcode
         run: |
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          test -d "$XCODE_SDK" || { echo "FATAL: SDK not found"; exit 1; }
           mkdir -p "$THEOS/sdks"
           ditto "$XCODE_SDK" "$THEOS/sdks/iPhoneOS18.4.sdk"
-          echo "SDK copied"
       
-      - name: Install fishhook into project
+      - name: Copy fishhook into project
         run: |
           mkdir -p $THEOS/include/fishhook
           cp $THEOS/vendor/orion/fishhook/fishhook.h $THEOS/include/fishhook/
@@ -44,18 +41,13 @@ jobs:
           export THEOS=/Users/runner/theos
           make clean
           make
-          
-          # Theos buries output deep in .theos/ — surface it
-          echo "Searching for built dylib..."
-          find . -name "*.dylib" -type f
-          
-          # Copy to a predictable location
-          cp $(find . -name "WinwalkHook.dylib" -type f | head -1) ../WinwalkHook.dylib
-          echo "Copied to repo root:"
+          find . -name "WinwalkHook.dylib" -type f -exec cp {} ../WinwalkHook.dylib \;
+          echo "BUILT:"
           ls -la ../WinwalkHook.dylib
+          file ../WinwalkHook.dylib
       
-      - name: Upload dylib artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
-          name: WinwalkHook.dylib
+          name: WinwalkHook_v2.dylib
           path: WinwalkHook.dylib

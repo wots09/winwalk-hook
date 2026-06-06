@@ -7,10 +7,10 @@
 
 static const NSInteger kInjectedCoins = 999999;
 
-// ────────── Foward declarations ──────────
-static void RLMSetAllCoins(Class cls, id realm, NSNumber *value);
+// ──────── Forward declarations ────────
+static void installFishHooksDelayed(void);
 
-// ────────── ObjC Swizzling ──────────
+// ──────── ObjC Swizzling (SAFE to run in constructor) ────────
 static NSInteger hookedCoinsGetter(id self, SEL _cmd) { return kInjectedCoins; }
 static NSInteger hookedCurrentCoinsGetter(id self, SEL _cmd) { return kInjectedCoins; }
 static NSInteger hookedStepGetter(id self, SEL _cmd) { return 99999900; }
@@ -57,77 +57,81 @@ static void swizzleAllCoinClasses(void) {
     free(allClasses);
 }
 
-// ────────── fishhook for Swift getters ──────────
+// ──────── fishhook — DELAYED to prevent crash ────────
 static NSInteger rep_coins(void) { return kInjectedCoins; }
 
-static void installFishHooks(void) {
+static void installFishHooksDelayed(void) {
+    NSLog(@"[WinwalkHack] Installing fishhook (delayed) ...");
     struct rebinding rebindings[] = {
-        {"_$s7winwalk11CoinBalanceV5coinsSivg", (void*)rep_coins, NULL},
-        {"_$s7winwalk14StepCoinsQueryV5coinsSivg", (void*)rep_coins, NULL},
-        {"_$s7winwalk13StepCoinBonusV5coinsSivg", (void*)rep_coins, NULL},
-        {"_$s7winwalk14ChallengeStateV12currentCoinsSivg", (void*)rep_coins, NULL},
-        {"_$s7winwalk9ChallengeV5coinsSivg", (void*)rep_coins, NULL},
-        {"_$s7winwalk9ChallengeV12currentCoinsSivg", (void*)rep_coins, NULL},
+        {"_$s7winwalk11CoinBalanceV5coinsSivg",             (void*)rep_coins, NULL},
+        {"_$s7winwalk14StepCoinsQueryV5coinsSivg",          (void*)rep_coins, NULL},
+        {"_$s7winwalk13StepCoinBonusV5coinsSivg",           (void*)rep_coins, NULL},
+        {"_$s7winwalk14ChallengeStateV12currentCoinsSivg",  (void*)rep_coins, NULL},
+        {"_$s7winwalk9ChallengeV5coinsSivg",                (void*)rep_coins, NULL},
+        {"_$s7winwalk9ChallengeV12currentCoinsSivg",        (void*)rep_coins, NULL},
     };
-    rebind_symbols(rebindings,
-        sizeof(rebindings) / sizeof(struct rebinding));
+    int count = sizeof(rebindings) / sizeof(struct rebinding);
+    int result = rebind_symbols(rebindings, count);
+    NSLog(@"[WinwalkHack] fishhook done: %d rebindings, result=%d", count, result);
 }
 
-// ────────── Realm DB brute-force patcher ──────────
-static void RLMSetAllCoins(Class cls, id realm, NSNumber *value) {
-    id results = ((id (*)(Class, SEL, id))objc_msgSend)(cls, sel_getUid("allObjectsInRealm:"), realm);
-    if (!results) return;
-    
-    id enumerator = ((id (*)(id, SEL))objc_msgSend)(results, sel_getUid("objectEnumerator"));
-    if (!enumerator) return;
-    
-    id obj;
-    while ((obj = ((id (*)(id, SEL))objc_msgSend)(enumerator, sel_getUid("nextObject")))) {
-        @try {
-            ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), value, @"currentCoins");
-        } @catch (id e) {}
-        @try {
-            ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), value, @"coins");
-        } @catch (id e) {}
-        @try {
-            ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), @99999900, @"step");
-        } @catch (id e) {}
-    }
-}
-
+// ──────── Realm DB brute-force patcher ────────
 static void patchRealmDB(void) {
     Class realmClass = NSClassFromString(@"RLMRealm");
     if (!realmClass) return;
-    
+
     id realm = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultRealm"));
     if (!realm) return;
-    
+
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
-    
+
     NSArray *classNames = @[@"RealmChallengeItem", @"RealmRewardItem",
                             @"RealmStreakChallengeItem"];
+    NSArray *keys = @[@"coins", @"currentCoins", @"step"];
+    NSArray *values = @[@(kInjectedCoins), @(kInjectedCoins), @99999900];
+
     for (NSString *cn in classNames) {
         Class mc = NSClassFromString(cn);
-        if (mc) RLMSetAllCoins(mc, realm, @(kInjectedCoins));
+        if (!mc) continue;
+        id results = ((id (*)(Class, SEL, id))objc_msgSend)(mc, sel_getUid("allObjectsInRealm:"), realm);
+        if (!results) continue;
+        id enumerator = ((id (*)(id, SEL))objc_msgSend)(results, sel_getUid("objectEnumerator"));
+        if (!enumerator) continue;
+        id obj;
+        while ((obj = ((id (*)(id, SEL))objc_msgSend)(enumerator, sel_getUid("nextObject")))) {
+            for (int i = 0; i < 3; i++) {
+                @try {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), values[i], keys[i]);
+                } @catch (id e) {}
+            }
+        }
     }
-    
+
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("commitWriteTransaction"));
 }
 
-// ────────── Constructor ──────────
+// ──────── Constructor — SAFE: no fishhook here ────────
 __attribute__((constructor))
 static void WinwalkHackInit(void) {
     NSLog(@"[WinwalkHack] =====================================");
-    NSLog(@"[WinwalkHack] Dylib loaded — installing coin hooks");
-    NSLog(@"[WinwalkHack] Injected coins: %ld", (long)kInjectedCoins);
+    NSLog(@"[WinwalkHack] Dylib v2 — coin hooks loading");
+    NSLog(@"[WinwalkHack] Injected value: %ld coins", (long)kInjectedCoins);
     NSLog(@"[WinwalkHack] =====================================");
     
+    // Stage 1: ObjC swizzling (safe immediately)
     swizzleAllCoinClasses();
-    installFishHooks();
+    NSLog(@"[WinwalkHack] Stage 1 done: ObjC swizzling");
     
+    // Stage 2: Delay fishhook by 3 seconds (prevents dyld crash)
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        installFishHooksDelayed();
+    });
+    
+    // Stage 3: Realm DB fallback every 10 seconds
     [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t) {
         patchRealmDB();
     }];
     
-    NSLog(@"[WinwalkHack] All hooks installed.");
+    NSLog(@"[WinwalkHack] Init complete. fishhook staged for +3s.");
 }
