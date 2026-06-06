@@ -37,8 +37,6 @@ jobs:
           cp $THEOS/vendor/orion/fishhook/fishhook.h $THEOS/include/fishhook/
           cp $THEOS/vendor/orion/fishhook/fishhook.h tweak/
           cp $THEOS/vendor/orion/fishhook/fishhook.c tweak/
-          echo "fishhook.h and fishhook.c copied to tweak/"
-          ls -la tweak/fishhook.*
       
       - name: Build dylib
         run: |
@@ -46,9 +44,18 @@ jobs:
           export THEOS=/Users/runner/theos
           make clean
           make
+          
+          # Theos buries output deep in .theos/ — surface it
+          echo "Searching for built dylib..."
+          find . -name "*.dylib" -type f
+          
+          # Copy to a predictable location
+          cp $(find . -name "WinwalkHook.dylib" -type f | head -1) ../WinwalkHook.dylib
+          echo "Copied to repo root:"
+          ls -la ../WinwalkHook.dylib
       
       - name: Upload dylib artifact
         uses: actions/upload-artifact@v5
         with:
           name: WinwalkHook.dylib
-          path: tweak/WinwalkHook.dylib
+          path: WinwalkHook.dylib
