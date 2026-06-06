@@ -25,24 +25,19 @@ jobs:
       
       - name: Install iOS SDK from Xcode
         run: |
-          set -e
-          echo "THEOS=$THEOS"
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          echo "Xcode SDK at: $XCODE_SDK"
           test -d "$XCODE_SDK" || { echo "FATAL: SDK not found"; exit 1; }
-          
           mkdir -p "$THEOS/sdks"
           ditto "$XCODE_SDK" "$THEOS/sdks/iPhoneOS18.4.sdk"
-          echo "SDK copied successfully"
-          ls "$THEOS/sdks/iPhoneOS18.4.sdk" | head -5
+          echo "SDK copied: $(ls $THEOS/sdks/iPhoneOS18.4.sdk | head -3)"
       
-      - name: Install fishhook
+      - name: Link fishhook (already in Theos submodules)
         run: |
-          curl -fsSL https://github.com/facebook/fishhook/archive/v0.2.tar.gz \
-            -o fishhook.tar.gz
-          tar xzf fishhook.tar.gz
-          cp fishhook-0.2/fishhook.h $THEOS/include/
-          cp fishhook-0.2/fishhook.c $THEOS/lib/
+          # Theos already cloned fishhook at vendor/orion/fishhook
+          # Just copy the files to where Theos expects them
+          cp $THEOS/vendor/orion/fishhook/fishhook.h $THEOS/include/
+          cp $THEOS/vendor/orion/fishhook/fishhook.c $THEOS/lib/
+          echo "fishhook installed from Theos submodule"
       
       - name: Build dylib
         run: |
