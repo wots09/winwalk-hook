@@ -69,28 +69,49 @@ static void installFishHooks(void) {
         sizeof(rebindings) / sizeof(struct rebinding));
 }
 
-// ────────── Realm DB brute-force patcher (fallback) ──────────
+// ────────── Realm DB brute-force patcher (belt and suspenders) ──────────
 static void patchRealmDB(void) {
-    // Tries every 3 seconds — belt and suspenders
     Class realmClass = NSClassFromString(@"RLMRealm");
     if (!realmClass) return;
     
-    id realm = [realmClass performSelector:@selector(defaultRealm)];
+    id realm = objc_msgSend(realmClass, sel_getUid("defaultRealm"));
     if (!realm) return;
     
-    [realm performSelector:@selector(beginWriteTransaction)];
+    objc_msgSend(realm, sel_getUid("beginWriteTransaction"));
     
-    NSArray *modelNames = @[@"RealmChallengeItem", @"RealmRewardItem",
-                            @"RealmStreakChallengeItem", @"RealmDailyStepModel"];
-    for (NSString *mn in modelNames) {
-        Class mc = NSClassFromString(mn);
+    NSArray *classNames = @[@"RealmChallengeItem", @"RealmRewardItem",
+                            @"RealmStreakChallengeItem"];
+    for (NSString *cn in classNames) {
+        Class mc = NSClassFromString(cn);
         if (!mc) continue;
-        id results = [realmClass performSelector:@selector(allObjectsInRealm:) 
-                                      withObject:realm];
-        // Simplified — the full version iterates and sets values
+        RLMSetAllCoins(mc, realm, @(kInjectedCoins));
     }
     
-    [realm performSelector:@selector(commitWriteTransaction)];
+    objc_msgSend(realm, sel_getUid("commitWriteTransaction"));
+}
+
+static void RLMSetAllCoins(Class cls, id realm, NSNumber *value) {
+    // Walk all objects of this class and set coin properties to injected value
+    id results = objc_msgSend(cls, sel_getUid("allObjectsInRealm:"), realm);
+    if (!results) return;
+    
+    // Iterate using fast enumeration
+    id enumerator = objc_msgSend(results, sel_getUid("objectEnumerator"));
+    if (!enumerator) return;
+    
+    id obj;
+    while ((obj = objc_msgSend(enumerator, sel_getUid("nextObject")))) {
+        // Try setting coins
+        @try {
+            objc_msgSend(obj, sel_getUid("setValue:forKey:"), value, @"currentCoins");
+        } @catch (id e) {}
+        @try {
+            objc_msgSend(obj, sel_getUid("setValue:forKey:"), value, @"coins");
+        } @catch (id e) {}
+        @try {
+            objc_msgSend(obj, sel_getUid("setValue:forKey:"), @99999900, @"step");
+        } @catch (id e) {}
+    }
 }
 
 // ────────── Constructor ──────────
@@ -104,8 +125,8 @@ static void WinwalkHackInit(void) {
     swizzleAllCoinClasses();
     installFishHooks();
     
-    // Realm DB patcher — runs every 3 seconds as ultimate fallback
-    [NSTimer scheduledTimerWithTimeInterval:3.0 repeats:YES block:^(NSTimer *t) {
+    // Realm DB patcher runs every 10 seconds as ultimate fallback
+    [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t) {
         patchRealmDB();
     }];
     
