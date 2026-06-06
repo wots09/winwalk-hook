@@ -1,4 +1,4 @@
-name: Build WinwalkHook V2
+name: Build + Inject + Repack IPA
 
 on:
   push:
@@ -35,19 +35,47 @@ jobs:
           cp $THEOS/vendor/orion/fishhook/fishhook.h tweak/
           cp $THEOS/vendor/orion/fishhook/fishhook.c tweak/
       
-      - name: Build dylib
+      - name: Build WinwalkHook.dylib
         run: |
           cd tweak
           export THEOS=/Users/runner/theos
           make clean
           make
           find . -name "WinwalkHook.dylib" -type f -exec cp {} ../WinwalkHook.dylib \;
-          echo "BUILT:"
-          ls -la ../WinwalkHook.dylib
+          echo "Dylib built:"
           file ../WinwalkHook.dylib
       
-      - name: Upload artifact
+      - name: Build insert_dylib
+        run: |
+          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+          cd /tmp/insert_dylib
+          xcodebuild -project insert_dylib.xcodeproj -target insert_dylib -configuration Release -sdk macosx
+          cp build/Release/insert_dylib /Users/runner/work/winwalk-hook/winwalk-hook/
+          echo "insert_dylib built:"
+          file /Users/runner/work/winwalk-hook/winwalk-hook/insert_dylib
+      
+      - name: Copy dylib + inject into binary
+        run: |
+          cp WinwalkHook.dylib app/Payload/winwalk.app/
+          ./insert_dylib @executable_path/WinwalkHook.dylib app/Payload/winwalk.app/winwalk --all-yes
+          echo "Injection done. Load commands:"
+          otool -L app/Payload/winwalk.app/winwalk | grep -i hook
+      
+      - name: Repack IPA
+        run: |
+          cd app
+          zip -qr ../winwalk_hooked.ipa Payload/
+          cd ..
+          ls -la winwalk_hooked.ipa
+      
+      - name: Upload hooked IPA
         uses: actions/upload-artifact@v5
         with:
-          name: WinwalkHook_v2.dylib
+          name: winwalk_hooked.ipa
+          path: winwalk_hooked.ipa
+      
+      - name: Upload dylib only (backup)
+        uses: actions/upload-artifact@v5
+        with:
+          name: WinwalkHook.dylib
           path: WinwalkHook.dylib
