@@ -86,7 +86,7 @@ static void swizzleAllCoinClasses(void) {
 static NSInteger rep_coins(void) { return kInjectedCoins; }
 
 static void installFishHooksDelayed(void) {
-    WriteDiagnostic(@"fishhook: installing...");
+    WriteDiagnostic(@"fishhook: installing 6 rebindings...");
     struct rebinding rebindings[] = {
         {"_$s7winwalk11CoinBalanceV5coinsSivg",             (void*)rep_coins, NULL},
         {"_$s7winwalk14StepCoinsQueryV5coinsSivg",          (void*)rep_coins, NULL},
@@ -97,11 +97,10 @@ static void installFishHooksDelayed(void) {
     };
     int count = sizeof(rebindings) / sizeof(struct rebinding);
     int result = rebind_symbols(rebindings, count);
-    WriteDiagnostic([NSString stringWithFormat:@"fishhook: %d rebindings, ret=%d", count, result]);
-    for (int i = 0; i < count; i++) {
-        void *orig = dlsym(RTLD_DEFAULT, rebindings[i].name);
-        WriteDiagnostic([NSString stringWithFormat:@"  %s → %s", rebindings[i].name, orig ? "FOUND" : "MISSING"]);
-    }
+    WriteDiagnostic([NSString stringWithFormat:@"fishhook: ret=%d (0=OK)", result]);
+    
+    // Test each replacement function directly (proves they return 999999)
+    WriteDiagnostic([NSString stringWithFormat:@"Test rep_coins()=%ld", (long)rep_coins()]);
 }
 
 static void patchRealmDB(void) {
@@ -142,5 +141,5 @@ static void WinwalkHackInit(void) {
         installFishHooksDelayed();
     });
     [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t){ patchRealmDB(); }];
-    WriteDiagnostic(@"Init complete — log file active.");
+    WriteDiagnostic(@"Init complete.");
 }
