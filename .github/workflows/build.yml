@@ -25,18 +25,16 @@ jobs:
       
       - name: Install iOS SDK from Xcode
         run: |
+          set -e
+          echo "THEOS=$THEOS"
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-          SDK_DIR=$THEOS/sdks/iPhoneOS18.4.sdk
-          mkdir -p $THEOS/sdks
-          cp -a "$XCODE_SDK" "$SDK_DIR"
+          echo "Xcode SDK at: $XCODE_SDK"
+          test -d "$XCODE_SDK" || { echo "FATAL: SDK not found"; exit 1; }
           
-          MAC_SDK=$(xcrun --sdk macosx --show-sdk-path)
-          mkdir -p "$SDK_DIR/System/Library/Frameworks/IOKit.framework"
-          cp -a "$MAC_SDK/System/Library/Frameworks/IOKit.framework/Headers" \
-            "$SDK_DIR/System/Library/Frameworks/IOKit.framework/" 2>/dev/null || true
-          
-          echo "SDK installed at: $SDK_DIR"
-          ls "$SDK_DIR"
+          mkdir -p "$THEOS/sdks"
+          ditto "$XCODE_SDK" "$THEOS/sdks/iPhoneOS18.4.sdk"
+          echo "SDK copied successfully"
+          ls "$THEOS/sdks/iPhoneOS18.4.sdk" | head -5
       
       - name: Install fishhook
         run: |
