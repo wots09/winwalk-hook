@@ -15,47 +15,25 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       
-      - name: Install Theos (skip broken SDK auto-download)
+      - name: Install Theos
         run: |
           export THEOS=/Users/runner/theos
           echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
-          
-          # Clone Theos manually WITHOUT running its broken SDK fetcher
           git clone --depth 1 --recursive \
             https://github.com/theos/theos.git $THEOS
-          
-          # Install ldid (needed for signing)
           brew install ldid
       
-      - name: Download iOS SDK
+      - name: Install iOS SDK from Xcode
         run: |
-          # Use xybp888's pre-extracted SDKs — no GitHub API needed
-          # iPhoneOS18.4.sdk works with Xcode 16 (what macos-latest has)
-          curl -fsSL \
-            "https://raw.githubusercontent.com/xybp888/iOS-SDKs/master/iPhoneOS18.4.sdk.tar.xz" \
-            -o /tmp/sdk.tar.xz
-          
-          # But that raw URL won't work directly for binary files...
-          # Better approach: use the repo's sparse checkout
-          # Actually, let's just use the SDK that comes WITH the macOS runner
-          
-          # The runner has Xcode installed — symlink its SDK
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           SDK_DIR=$THEOS/sdks/iPhoneOS18.4.sdk
           mkdir -p $THEOS/sdks
           cp -a "$XCODE_SDK" "$SDK_DIR"
           
-          # Patch the SDK for Theos compatibility
-          # Theos needs some macOS headers that Xcode's iOS SDK doesn't have
           MAC_SDK=$(xcrun --sdk macosx --show-sdk-path)
-          
-          # Copy IOKit headers that Theos tweaks need
+          mkdir -p "$SDK_DIR/System/Library/Frameworks/IOKit.framework"
           cp -a "$MAC_SDK/System/Library/Frameworks/IOKit.framework/Headers" \
             "$SDK_DIR/System/Library/Frameworks/IOKit.framework/" 2>/dev/null || true
-          
-          # Set minimum deployment target
-          plutil -replace MinimumSDKVersion -string "14.0" \
-            "$SDK_DIR/SDKSettings.plist" 2>/dev/null || true
           
           echo "SDK installed at: $SDK_DIR"
           ls "$SDK_DIR"
