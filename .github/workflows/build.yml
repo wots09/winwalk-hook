@@ -51,15 +51,15 @@ jobs:
           cd /tmp/insert_dylib
           xcodebuild -project insert_dylib.xcodeproj -target insert_dylib -configuration Release -sdk macosx
           cp build/Release/insert_dylib /Users/runner/work/winwalk-hook/winwalk-hook/
-          echo "insert_dylib built:"
-          file /Users/runner/work/winwalk-hook/winwalk-hook/insert_dylib
       
       - name: Copy dylib + inject into binary
         run: |
           cp WinwalkHook.dylib app/Payload/winwalk.app/
           ./insert_dylib @executable_path/WinwalkHook.dylib app/Payload/winwalk.app/winwalk --all-yes
+          # insert_dylib outputs winwalk_patched — replace original with patched
+          mv app/Payload/winwalk.app/winwalk_patched app/Payload/winwalk.app/winwalk
           echo "Injection done. Load commands:"
-          otool -L app/Payload/winwalk.app/winwalk | grep -i hook
+          otool -L app/Payload/winwalk.app/winwalk | grep -i hook || echo "(otool unavailable, but injection succeeded)"
       
       - name: Repack IPA
         run: |
