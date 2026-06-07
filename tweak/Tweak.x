@@ -4,6 +4,8 @@
 
 static const NSInteger kInjectedCoins = 999999;
 
+@class WinwalkInterceptor;
+
 static void WriteDiagnostic(NSString *msg) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
     if (!docs) docs = @"/tmp";
