@@ -4,7 +4,7 @@
 
 static const NSInteger kInjectedCoins = 999999;
 static BOOL sDidInit = NO;
-static BOOL sFirstDump = YES;
+static BOOL sDumped = NO;
 
 static void Log(NSString *msg) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -21,7 +21,7 @@ static void Log(NSString *msg) {
     }
 }
 
-// ─── UserDefaults (V10 proven-safe) ───
+// ─── UserDefaults ───
 static id (*orig_objectForKey)(id, SEL, NSString*);
 
 static id hooked_objectForKey(id self, SEL _cmd, NSString *key) {
@@ -42,18 +42,17 @@ static void ForceWriteUD(void) {
     [ud synchronize];
 }
 
-// ─── Realm — READ-ONLY dump, then ONLY V10-proven safe writes ───
+// ─── Realm — ONLY V10-safe writes, dump names only (no type call) ───
 static void PatchRealm(void) {
     @try {
         Class rc = NSClassFromString(@"RLMRealm");
         if (!rc) return;
         id realm = ((id (*)(Class, SEL))objc_msgSend)(rc, sel_getUid("defaultRealm"));
         if (!realm) return;
+        
         id schema = ((id (*)(id, SEL))objc_msgSend)(realm, sel_getUid("schema"));
         id schemas = ((id (*)(id, SEL))objc_msgSend)(schema, sel_getUid("objectSchema"));
         unsigned long n = ((unsigned long (*)(id, SEL))objc_msgSend)(schemas, sel_getUid("count"));
-        
-        if (sFirstDump) Log([NSString stringWithFormat:@"=== Schema: %lu types ===", n]);
         
         ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
         int patched = 0;
@@ -67,17 +66,16 @@ static void PatchRealm(void) {
             unsigned long pc = ((unsigned long (*)(id, SEL))objc_msgSend)(props, sel_getUid("count"));
             
             NSMutableDictionary *kv = [NSMutableDictionary dictionary];
-            NSMutableArray *dump = sFirstDump ? [NSMutableArray array] : nil;
+            NSMutableArray *names = (!sDumped) ? [NSMutableArray array] : nil;
             
             for (unsigned long j = 0; j < pc; j++) {
                 id prop = ((id (*)(id, SEL, unsigned long))objc_msgSend)(props, sel_getUid("objectAtIndex:"), j);
                 NSString *name = ((id (*)(id, SEL))objc_msgSend)(prop, sel_getUid("name"));
-                NSString *type = ((id (*)(id, SEL))objc_msgSend)(prop, sel_getUid("type"));
                 NSString *lower = [name lowercaseString];
                 
-                if (sFirstDump) [dump addObject:[NSString stringWithFormat:@"%@(%@)", name, type ?: @"?"]];
+                if (names) [names addObject:name];
                 
-                // ONLY V10-proven safe writes — nothing else
+                // V10-safe writes ONLY
                 if ([lower containsString:@"coin"] || [lower hasSuffix:@"coins"] || [lower containsString:@"balance"])
                     kv[name] = @(kInjectedCoins);
                 else if ([lower isEqualToString:@"step"])
@@ -90,13 +88,12 @@ static void PatchRealm(void) {
                     kv[name] = @7200;
             }
             
-            if (sFirstDump && dump.count > 0)
-                Log([NSString stringWithFormat:@"  %@: %@", cn, [dump componentsJoinedByString:@", "]]);
+            if (names && names.count > 0)
+                Log([NSString stringWithFormat:@"  %@: %@", cn, [names componentsJoinedByString:@", "]]);
             
             if (!kv.count) continue;
             
             id results = ((id (*)(id, SEL, NSString*, NSString*))objc_msgSend)(realm, sel_getUid("objects:where:"), cn, nil);
-            if (!results) continue;
             unsigned long oc = ((unsigned long (*)(id, SEL))objc_msgSend)(results, sel_getUid("count"));
             for (unsigned long k = 0; k < oc; k++) {
                 id obj = ((id (*)(id, SEL, unsigned long))objc_msgSend)(results, sel_getUid("objectAtIndex:"), k);
@@ -108,25 +105,24 @@ static void PatchRealm(void) {
         }
         
         ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("commitWriteTransaction"));
-        if (sFirstDump) { Log(@"=== End Dump ==="); sFirstDump = NO; }
-        Log([NSString stringWithFormat:@"Realm: %d objs", patched]);
-    } @catch (id e) {
-        Log([NSString stringWithFormat:@"Realm EXC: %@", e]);
+        if (!sDumped) { Log(@"=== Property dump complete ==="); sDumped = YES; }
+        Log([NSString stringWithFormat:@"Realm: %d objects", patched]);
+    } @catch (NSException *e) {
+        Log([NSString stringWithFormat:@"Realm EXC: %@ — %@", e.name, e.reason]);
     }
 }
 
-// ─── Constructor ───
 __attribute__((constructor))
 static void Init(void) {
     if (sDidInit) return;
     sDidInit = YES;
-    Log(@"========== V16 — READ-ONLY DUMP, SAFE WRITES ==========");
+    Log(@"========== V17 — NO TYPE CALL, SAFE ==========");
     
     Method m = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
     orig_objectForKey = (void*)method_getImplementation(m);
     method_setImplementation(m, (IMP)hooked_objectForKey);
     
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
         ForceWriteUD();
         PatchRealm();
@@ -134,6 +130,6 @@ static void Init(void) {
             ForceWriteUD();
             PatchRealm();
         }];
-        Log(@"✓ Patcher started");
+        Log(@"✓ Patcher running");
     });
 }
