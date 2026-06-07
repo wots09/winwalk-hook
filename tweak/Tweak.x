@@ -4,6 +4,7 @@
 #import <objc/message.h>
 
 static const NSInteger kInjectedCoins = 999999;
+static const NSInteger kInjectedSteps = 50000;  // Realistic — 50k steps ≈ $500+ in challenges
 static BOOL sDidInit = NO;
 
 static void Log(NSString *msg) {
@@ -21,58 +22,10 @@ static void Log(NSString *msg) {
     }
 }
 
-// ─── V25: handles PascalCase + Result key ───
-static void FixResponse(NSMutableDictionary *dict) {
-    // 1. Neutralize ReturnValue (negative → 0)
-    if ([dict[@"ReturnValue"] respondsToSelector:@selector(integerValue)] && [dict[@"ReturnValue"] integerValue] < 0) {
-        Log([NSString stringWithFormat:@"  ReturnValue %ld→0", (long)[dict[@"ReturnValue"] integerValue]]);
-        dict[@"ReturnValue"] = @0;
-    }
-    if ([dict[@"returnValue"] respondsToSelector:@selector(integerValue)] && [dict[@"returnValue"] integerValue] < 0) {
-        dict[@"returnValue"] = @0;
-    }
-    
-    // 2. Suppress error display
-    if (dict[@"ShowsMessage"]) dict[@"ShowsMessage"] = @NO;
-    if (dict[@"showsMessage"]) dict[@"showsMessage"] = @NO;
-    if (dict[@"Message"]) dict[@"Message"] = @"OK";
-    if (dict[@"message"]) dict[@"message"] = @"OK";
-    
-    // 3. Inject 999999 into Result if it's a number (the GetUserCoins pattern)
-    if ([dict[@"Result"] isKindOfClass:[NSNumber class]]) {
-        dict[@"Result"] = @(kInjectedCoins);
-        Log(@"  Result(number) → 999999");
-    }
-    // If Result is array of objects, recurse
-    if ([dict[@"Result"] isKindOfClass:[NSMutableArray class]]) {
-        for (id item in (NSMutableArray *)dict[@"Result"])
-            if ([item isKindOfClass:[NSMutableDictionary class]]) FixResponse(item);
-    }
-    
-    // 4. Fix IsClaimReady (PascalCase) + coin-related fields
-    NSArray *claimKeys = @[@"IsClaimReady", @"isClaimReady", @"isDone", @"IsDone", @"canClaim", @"CanClaim"];
-    for (NSString *ck in claimKeys) {
-        if (dict[ck]) dict[ck] = @YES;
-    }
-    
-    // 5. Inject coins into any remaining coin/balance/point/result/coins keys
-    for (NSString *key in [dict allKeys]) {
-        NSString *lower = [key lowercaseString];
-        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"] || [lower isEqualToString:@"result"]) &&
-            [dict[key] isKindOfClass:[NSNumber class]] && [dict[key] integerValue] != kInjectedCoins) {
-            dict[key] = @(kInjectedCoins);
-        }
-        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) FixResponse(dict[key]);
-        if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
-            for (id item in (NSMutableArray *)dict[key])
-                if ([item isKindOfClass:[NSMutableDictionary class]]) FixResponse(item);
-        }
-    }
-}
-
 // ─── NSURLProtocol ───
 @interface WinwalkProtocol : NSURLProtocol <NSURLSessionDataDelegate>
 @property (nonatomic, strong) NSMutableData *mData;
+@property (nonatomic, strong) NSURLResponse *mResponse;
 @end
 
 @implementation WinwalkProtocol
@@ -87,10 +40,45 @@ static void FixResponse(NSMutableDictionary *dict) {
 - (void)startLoading {
     NSMutableURLRequest *mr = [self.request mutableCopy];
     [NSURLProtocol setProperty:@YES forKey:@"__wp" inRequest:mr];
+    
     NSString *url = mr.URL.absoluteString;
-    if ([url containsString:@"ClaimChallenge"] || [url containsString:@"AddUserReward"] ||
-        [url containsString:@"GetUserCoins"] || [url containsString:@"GetChallengeStates"])
-        Log([NSString stringWithFormat:@"🎯 %@ %@", mr.HTTPMethod, url]);
+    BOOL loggable = [url containsString:@"ClaimChallenge"] || [url containsString:@"AddUserReward"] ||
+                    [url containsString:@"GetUserCoins"] || [url containsString:@"GetChallengeStates"] ||
+                    [url containsString:@"UpdateUserStep"];
+    
+    // ─── INJECT inflated steps into UpdateUserStep requests ───
+    if ([url containsString:@"UpdateUserStep"] && mr.HTTPBody) {
+        @try {
+            NSString *bodyStr = [[NSString alloc] initWithData:mr.HTTPBody encoding:NSUTF8StringEncoding];
+            id bodyJson = [NSJSONSerialization JSONObjectWithData:mr.HTTPBody options:NSJSONReadingMutableContainers error:nil];
+            if ([bodyJson isKindOfClass:[NSMutableDictionary class]]) {
+                NSMutableDictionary *bd = (NSMutableDictionary *)bodyJson;
+                // Find the step field (could be "step", "steps", "Step", "StepCount", etc.)
+                for (NSString *key in [bd allKeys]) {
+                    NSString *lower = [key lowercaseString];
+                    if ([lower containsString:@"step"] && [bd[key] isKindOfClass:[NSNumber class]]) {
+                        NSInteger orig = [bd[key] integerValue];
+                        bd[key] = @(kInjectedSteps);
+                        Log([NSString stringWithFormat:@"🏃 UpdateUserStep: %@ %ld→%ld", key, (long)orig, (long)kInjectedSteps]);
+                    }
+                }
+                // If no step key found, log the body to discover the schema
+                if (![bodyStr containsString:@"step"] && ![bodyStr containsString:@"Step"]) {
+                    Log([NSString stringWithFormat:@"🏃 UpdateUserStep BODY: %@", bodyStr.length > 300 ? [[bodyStr substringToIndex:300] stringByAppendingString:@"..."] : bodyStr]);
+                }
+                NSData *newBody = [NSJSONSerialization dataWithJSONObject:bd options:0 error:nil];
+                if (newBody) {
+                    mr.HTTPBody = newBody;
+                    Log(@"  → Steps injected into request body");
+                }
+            }
+        } @catch (id e) {
+            Log([NSString stringWithFormat:@"  UpdateUserStep parse error: %@", e]);
+        }
+    }
+    
+    if (loggable) Log([NSString stringWithFormat:@"🎯 %@ %@", mr.HTTPMethod, url]);
+    
     NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
     cfg.protocolClasses = nil;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
@@ -101,29 +89,81 @@ static void FixResponse(NSMutableDictionary *dict) {
 - (void)stopLoading {}
 - (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t didReceiveResponse:(NSURLResponse *)r
     completionHandler:(void (^)(NSURLSessionResponseDisposition))h {
+    self.mResponse = r;
     [self.client URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
     h(NSURLSessionResponseAllow);
 }
 - (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t didReceiveData:(NSData *)d { [self.mData appendData:d]; }
 
+// ─── Response modification ───
+static void FixDict(NSMutableDictionary *d) {
+    // Neutralize ReturnValue
+    if ([d[@"ReturnValue"] isKindOfClass:[NSNumber class]] && [d[@"ReturnValue"] integerValue] < 0)
+        d[@"ReturnValue"] = @0;
+    if ([d[@"returnValue"] isKindOfClass:[NSNumber class]] && [d[@"returnValue"] integerValue] < 0)
+        d[@"returnValue"] = @0;
+    
+    // Suppress error display
+    if (d[@"ShowsMessage"]) d[@"ShowsMessage"] = @NO;
+    if (d[@"showsMessage"]) d[@"showsMessage"] = @NO;
+    if (d[@"Message"]) d[@"Message"] = @"OK";
+    if (d[@"message"]) d[@"message"] = @"OK";
+    if (d[@"error"] && [d[@"error"] isKindOfClass:[NSString class]])
+        d[@"error"] = [NSNull null];
+    
+    // Inject Result = 999999 (coin balance)
+    if ([d[@"Result"] isKindOfClass:[NSNumber class]])
+        d[@"Result"] = @(kInjectedCoins);
+    
+    // Fix claim-ready flags (both cases)
+    NSArray *ck = @[@"IsClaimReady",@"isClaimReady",@"IsDone",@"isDone",@"CanClaim",@"canClaim"];
+    for (NSString *k in ck) if (d[k]) d[k] = @YES;
+    
+    // Inject coin values into all number fields matching coin/balance/point/result
+    for (NSString *key in [d allKeys]) {
+        NSString *l = [key lowercaseString];
+        if ([d[key] isKindOfClass:[NSNumber class]]) {
+            if ([l containsString:@"coin"] || [l containsString:@"balance"] || [l isEqualToString:@"point"] || [l isEqualToString:@"result"])
+                d[key] = @(kInjectedCoins);
+            if ([l containsString:@"step"] && [d[key] integerValue] < kInjectedSteps)
+                d[key] = @(kInjectedSteps);
+        }
+        if ([d[key] isKindOfClass:[NSMutableDictionary class]]) FixDict(d[key]);
+        if ([d[key] isKindOfClass:[NSMutableArray class]]) {
+            for (id item in (NSMutableArray *)d[key])
+                if ([item isKindOfClass:[NSMutableDictionary class]]) FixDict(item);
+        }
+    }
+}
+
 - (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t didCompleteWithError:(NSError *)err {
     if (err) { [self.client URLProtocol:self didFailWithError:err]; return; }
     NSData *raw = [self.mData copy];
-    @try {
-        id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
-        if ([json isKindOfClass:[NSMutableDictionary class]]) {
-            FixResponse((NSMutableDictionary *)json);
-            raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        } else if ([json isKindOfClass:[NSMutableArray class]]) {
-            for (id item in (NSMutableArray *)json)
-                if ([item isKindOfClass:[NSMutableDictionary class]]) FixResponse(item);
-            raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-        }
-        if (raw.length < 200) {
-            NSString *s = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-            if (s) Log([NSString stringWithFormat:@"  → %@", s]);
-        }
-    } @catch (id e) {}
+    NSString *url = self.request.URL.absoluteString;
+    
+    // Only process JSON responses for winwalk API
+    if ([url containsString:@"api.winwalk.app"]) {
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+            BOOL modified = NO;
+            if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                FixDict((NSMutableDictionary *)json);
+                modified = YES;
+            } else if ([json isKindOfClass:[NSMutableArray class]]) {
+                for (id item in (NSMutableArray *)json)
+                    if ([item isKindOfClass:[NSMutableDictionary class]]) FixDict(item);
+                modified = YES;
+            }
+            if (modified) {
+                raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                if (raw.length < 300) {
+                    NSString *s = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+                    if (s) Log([NSString stringWithFormat:@"  → %@", s]);
+                }
+            }
+        } @catch (id e) {}
+    }
+    
     [self.client URLProtocol:self didLoadData:raw];
     [self.client URLProtocolDidFinishLoading:self];
 }
@@ -132,13 +172,11 @@ static void FixResponse(NSMutableDictionary *dict) {
 
 // ─── Config hooks ───
 static id (*orig_defCfg)(Class, SEL); static id (*orig_ephCfg)(Class, SEL); static id (*orig_initCfg)(id, SEL, id);
-static void InjectProto(id cfg) {
-    @try {
-        NSMutableArray *p = [[cfg valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
-        Class wp = NSClassFromString(@"WinwalkProtocol");
-        if (wp && ![p containsObject:wp]) { [p insertObject:wp atIndex:0]; [cfg setValue:p forKey:@"protocolClasses"]; }
-    } @catch (id e) {}
-}
+static void InjectProto(id cfg) { @try {
+    NSMutableArray *p = [[cfg valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+    Class wp = NSClassFromString(@"WinwalkProtocol");
+    if (wp && ![p containsObject:wp]) { [p insertObject:wp atIndex:0]; [cfg setValue:p forKey:@"protocolClasses"]; }
+} @catch(id e){} }
 static id hk_defCfg(Class s, SEL c) { id x = orig_defCfg(s,c); InjectProto(x); return x; }
 static id hk_ephCfg(Class s, SEL c) { id x = orig_ephCfg(s,c); InjectProto(x); return x; }
 static id hk_initCfg(id s, SEL c, id cfg) { InjectProto(cfg); return orig_initCfg(s,c,cfg); }
@@ -152,7 +190,7 @@ static void hk_pVC(id s, SEL c, UIViewController *vc, BOOL a, id cb) {
         if ([t containsString:@"Oops"] || [t containsString:@"can't reach"] ||
             [t containsString:@"general error"] || [t containsString:@"try again later"] ||
             [t containsString:@"Need more coin"] || [t containsString:@"error occurred"]) {
-            Log([NSString stringWithFormat:@"🚫 Swallowed: %@", t]);
+            Log([NSString stringWithFormat:@"🚫 %@", t]);
             for (UIAlertAction *ac in al.actions)
                 if (ac.style == UIAlertActionStyleDefault || ac.style == UIAlertActionStyleCancel) {
                     void (^h)(UIAlertAction*) = [ac valueForKey:@"handler"]; if (h) { h(ac); break; }
@@ -190,7 +228,7 @@ static void PatchRealm(void) {
             NSString *cn = ((id (*)(id, SEL))objc_msgSend)(so, sel_getUid("className"));
             if (!cn || !([cn hasPrefix:@"winwalk."] || [cn hasPrefix:@"Realm"])) continue;
             NSMutableDictionary *kv = [NSMutableDictionary dictionary];
-            if ([cn isEqualToString:@"RealmDailyStepModel"]) { kv[@"step"]=@100000; kv[@"distance"]=@80.0; kv[@"calories"]=@500; kv[@"activeTime"]=@7200; }
+            if ([cn isEqualToString:@"RealmDailyStepModel"]) { kv[@"step"]=@(kInjectedSteps); kv[@"distance"]=@80.0; kv[@"calories"]=@500; kv[@"activeTime"]=@7200; }
             else if ([cn isEqualToString:@"RealmChallengeItem"]) { kv[@"coins"]=@(kInjectedCoins); kv[@"currentCoins"]=@(kInjectedCoins); kv[@"goalCoins"]=@1; kv[@"goalSteps"]=@1; kv[@"isClaimReady"]=@YES; }
             else if ([cn isEqualToString:@"RealmStreakChallengeItem"]) { kv[@"coins"]=@(kInjectedCoins); kv[@"isClaimReady"]=@YES; kv[@"isDone"]=@YES; }
             else if ([cn isEqualToString:@"RealmRewardItem"]) { kv[@"coins"]=@(kInjectedCoins); kv[@"minLevel"]=@0; }
@@ -211,7 +249,7 @@ static void PatchRealm(void) {
 __attribute__((constructor))
 static void Init(void) {
     if (sDidInit) return; sDidInit = YES;
-    Log(@"========== V25 — ISCLAIMREADY + RESULT FIX ==========");
+    Log(@"========== V26 — STEP INJECTION + DISABLED FIX ==========");
     [NSURLProtocol registerClass:[WinwalkProtocol class]];
     Method cm1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
     orig_defCfg = (void*)method_getImplementation(cm1); method_setImplementation(cm1, (IMP)hk_defCfg);
@@ -224,9 +262,9 @@ static void Init(void) {
     orig_pVC = (void*)method_getImplementation(am); method_setImplementation(am, (IMP)hk_pVC);
     Method um = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
     orig_ud = (void*)method_getImplementation(um); method_setImplementation(um, (IMP)hk_ud);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         ForceUD(); PatchRealm();
         [NSTimer scheduledTimerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *t) { ForceUD(); PatchRealm(); }];
-        Log(@"✓ Running");
+        Log(@"✓ Running — watch for 🏃 UpdateUserStep logs");
     });
 }
