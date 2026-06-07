@@ -19,83 +19,152 @@ static void WriteDiagnostic(NSString *msg) {
     }
 }
 
-// ─────────────────────────────────────
-// NETWORK INTERCEPTION — Hook NSURLSession dataTaskWithRequest
-// to log and modify API calls
-// ─────────────────────────────────────
+// ─────────────────────────────────────────────────
+// NSURLProtocol subclass — intercepts ALL HTTP traffic
+// ─────────────────────────────────────────────────
 
-static id (*orig_dataTaskWithRequest_completionHandler)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*));
+@interface WinwalkInterceptor : NSURLProtocol <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSURLSessionDataTask *task;
+@property (nonatomic, strong) NSMutableData *mutableData;
+@end
 
-static id hooked_dataTaskWithRequest_completionHandler(id self, SEL _cmd, NSURLRequest *req, void(^handler)(NSData*, NSURLResponse*, NSError*)) {
-    NSURL *url = req.URL;
-    NSString *urlStr = url.absoluteString;
+@implementation WinwalkInterceptor
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    // Only intercept HTTP/HTTPS
+    if (![request.URL.scheme isEqualToString:@"http"] &&
+        ![request.URL.scheme isEqualToString:@"https"]) return NO;
     
-    // Log all API calls to identify coin/balance endpoints
-    if ([urlStr containsString:@"coin"] || [urlStr containsString:@"balance"] ||
-        [urlStr containsString:@"reward"] || [urlStr containsString:@"redeem"] ||
-        [urlStr containsString:@"gift"] || [urlStr containsString:@"shop"] ||
-        [urlStr containsString:@"user"] || [urlStr containsString:@"profile"] ||
-        [urlStr containsString:@"wallet"] || [urlStr containsString:@"mission"]) {
-        
-        WriteDiagnostic([NSString stringWithFormat:@"📡 REQ: %@", urlStr]);
-        
-        if (req.HTTPBody) {
-            NSString *bodyStr = [[NSString alloc] initWithData:req.HTTPBody encoding:NSUTF8StringEncoding];
-            if (bodyStr.length > 500) bodyStr = [[bodyStr substringToIndex:500] stringByAppendingString:@"..."];
-            WriteDiagnostic([NSString stringWithFormat:@"   BODY: %@", bodyStr ?: @"(binary)"]);                   
+    // Don't intercept ourselves
+    if ([NSURLProtocol propertyForKey:@"WinwalkHandled" inRequest:request]) return NO;
+    
+    return YES;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request {
+    return request;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *mutableRequest = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"WinwalkHandled" inRequest:mutableRequest];
+    
+    NSString *urlStr = self.request.URL.absoluteString;
+    NSString *method = self.request.HTTPMethod ?: @"GET";
+    
+    // Log ALL requests (first 200 chars of URL)
+    NSString *shortURL = urlStr.length > 200 ? [[urlStr substringToIndex:200] stringByAppendingString:@"..."] : urlStr;
+    WriteDiagnostic([NSString stringWithFormat:@"📡 %@ %@", method, shortURL]);
+    
+    if (self.request.HTTPBody) {
+        NSString *body = [[NSString alloc] initWithData:self.request.HTTPBody encoding:NSUTF8StringEncoding];
+        if (body.length > 0) {
+            if (body.length > 500) body = [[body substringToIndex:500] stringByAppendingString:@"..."];
+            WriteDiagnostic([NSString stringWithFormat:@"   BODY: %@", body]);
         }
     }
     
-    // Wrap completion handler to intercept responses
-    void(^wrappedHandler)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        if ([urlStr containsString:@"coin"] || [urlStr containsString:@"balance"] ||
-            [urlStr containsString:@"reward"] || [urlStr containsString:@"redeem"] ||
-            [urlStr containsString:@"gift"] || [urlStr containsString:@"wallet"] ||
-            [urlStr containsString:@"user"]) {
-            
-            if (data) {
-                NSString *respStr = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
-                if (respStr.length > 800) respStr = [[respStr substringToIndex:800] stringByAppendingString:@"..."];
-                WriteDiagnostic([NSString stringWithFormat:@"📡 RESP(%@): %@", url.lastPathComponent, respStr ?: @"(binary)"]);
-                
-                // Attempt to inject coin values into JSON responses
-                @try {
-                    id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                    if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                        NSMutableDictionary *dict = (NSMutableDictionary *)json;
-                        BOOL modified = NO;
-                        for (NSString *key in [dict allKeys]) {
-                            NSString *lower = key.lowercaseString;
-                            if (([lower containsString:@"coin"] || [lower containsString:@"balance"]) &&
-                                [dict[key] isKindOfClass:[NSNumber class]]) {
-                                NSInteger currentVal = [dict[key] integerValue];
-                                if (currentVal > 0 && currentVal < kInjectedCoins) {
-                                    dict[key] = @(kInjectedCoins);
-                                    modified = YES;
-                                }
-                            }
-                        }
-                        if (modified) {
-                            NSData *newData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-                            if (newData) {
-                                WriteDiagnostic(@"   ✏️ Injected 999999 into response JSON");
-                                handler(newData, resp, err);
-                                return;
-                            }
-                        }
-                    }
-                } @catch (id e) {}
-            }
-        }
-        handler(data, resp, err);
-    };
+    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
+    config.protocolClasses = nil; // Don't re-intercept our own requests
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:config
+                                                          delegate:self
+                                                     delegateQueue:nil];
     
-    return orig_dataTaskWithRequest_completionHandler(self, _cmd, req, wrappedHandler);
+    self.mutableData = [NSMutableData data];
+    self.task = [session dataTaskWithRequest:mutableRequest];
+    [self.task resume];
 }
 
-// ─────────────────────────────────────
-// UserDefaults hooks + force write (V10, unchanged)
-// ─────────────────────────────────────
+- (void)stopLoading {
+    [self.task cancel];
+    self.task = nil;
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask
+    didReceiveResponse:(NSURLResponse *)response completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    [self.client URLProtocol:self didReceiveResponse:response cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    [self.mutableData appendData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
+    if (error) {
+        [self.client URLProtocol:self didFailWithError:error];
+    } else {
+        NSData *responseData = [self.mutableData copy];
+        NSString *urlStr = self.request.URL.absoluteString;
+        
+        // Try to inject coin values into JSON responses
+        BOOL injected = NO;
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:responseData options:NSJSONReadingMutableContainers error:nil];
+            
+            if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                NSMutableDictionary *dict = (NSMutableDictionary *)json;
+                if ([self injectCoinsIntoDict:dict]) {
+                    injected = YES;
+                    responseData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
+                }
+            } else if ([json isKindOfClass:[NSMutableArray class]]) {
+                NSMutableArray *arr = (NSMutableArray *)json;
+                BOOL anyInjected = NO;
+                for (id item in arr) {
+                    if ([item isKindOfClass:[NSMutableDictionary class]]) {
+                        if ([self injectCoinsIntoDict:(NSMutableDictionary *)item]) anyInjected = YES;
+                    }
+                }
+                if (anyInjected) {
+                    injected = YES;
+                    responseData = [NSJSONSerialization dataWithJSONObject:arr options:0 error:nil];
+                }
+            }
+            
+            if (injected) {
+                WriteDiagnostic([NSString stringWithFormat:@"   ✏️ INJECTED 999999 into response: %@",
+                                 urlStr.lastPathComponent]);
+            }
+        } @catch (id e) {}
+        
+        [self.client URLProtocol:self didLoadData:responseData];
+        [self.client URLProtocolDidFinishLoading:self];
+    }
+}
+
+- (BOOL)injectCoinsIntoDict:(NSMutableDictionary *)dict {
+    BOOL found = NO;
+    for (NSString *key in [dict allKeys]) {
+        NSString *lower = key.lowercaseString;
+        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"]) &&
+            [dict[key] isKindOfClass:[NSNumber class]]) {
+            NSInteger cv = [dict[key] integerValue];
+            if (cv != kInjectedCoins && cv != 0) {
+                dict[key] = @(kInjectedCoins);
+                found = YES;
+            }
+        }
+        // Recurse into nested dicts
+        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) {
+            if ([self injectCoinsIntoDict:(NSMutableDictionary *)dict[key]]) found = YES;
+        }
+        if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
+            for (id item in (NSMutableArray *)dict[key]) {
+                if ([item isKindOfClass:[NSMutableDictionary class]]) {
+                    if ([self injectCoinsIntoDict:(NSMutableDictionary *)item]) found = YES;
+                }
+            }
+        }
+    }
+    return found;
+}
+
+@end
+
+// ─────────────────────────────────────────────────
+// UserDefaults hooks + force write (unchanged)
+// ─────────────────────────────────────────────────
 
 static id (*orig_objectForKey)(id, SEL, NSString*);
 static NSInteger (*orig_integerForKey)(id, SEL, NSString*);
@@ -116,27 +185,24 @@ static NSInteger hooked_integerForKey(id self, SEL _cmd, NSString *key) {
 static NSDictionary* hooked_dictionaryRepresentation(id self, SEL _cmd) {
     NSMutableDictionary *dict = [orig_dictionaryRepresentation(self, _cmd) mutableCopy];
     for (NSString *key in [dict allKeys]) {
-        if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"]) {
-            dict[key] = @(kInjectedCoins);
-        }
+        if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"]) dict[key] = @(kInjectedCoins);
     }
     return [dict copy];
 }
 
 static void ForceWriteUserDefaults(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSArray *keys = @[@"totalCoin", @"totalIncomeCoins", @"weeklyLeagueCoins",
-                      @"todayEarnedCoins", @"bonusCoin", @"incomeMissionCoins",
-                      @"autoCollectionBonusCoins", @"videoMissionBonusCoins"];
-    for (NSString *key in keys) {
+    for (NSString *key in @[@"totalCoin",@"totalIncomeCoins",@"weeklyLeagueCoins",
+                            @"todayEarnedCoins",@"bonusCoin",@"incomeMissionCoins",
+                            @"autoCollectionBonusCoins",@"videoMissionBonusCoins"]) {
         [ud setObject:@(kInjectedCoins) forKey:key];
     }
     [ud synchronize];
 }
 
-// ─────────────────────────────────────
-// Realm DB patcher (V10, unchanged)
-// ─────────────────────────────────────
+// ─────────────────────────────────────────────────
+// Realm DB patcher (unchanged)
+// ─────────────────────────────────────────────────
 
 static void PatchRealmDB(void) {
     Class realmClass = NSClassFromString(@"RLMRealm");
@@ -181,9 +247,9 @@ static void PatchRealmDB(void) {
 // ─── Constructor ───
 __attribute__((constructor))
 static void Init(void) {
-    WriteDiagnostic(@"========== V11 — NETWORK INTERCEPTION ==========");
+    WriteDiagnostic(@"========== V12 — NSURLProtocol INTERCEPTOR ==========");
     
-    // NSUserDefaults swizzles
+    // UserDefaults swizzles
     Method m1 = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
     orig_objectForKey = (void*)method_getImplementation(m1);
     method_setImplementation(m1, (IMP)hooked_objectForKey);
@@ -196,18 +262,9 @@ static void Init(void) {
     orig_dictionaryRepresentation = (void*)method_getImplementation(m3);
     method_setImplementation(m3, (IMP)hooked_dictionaryRepresentation);
     
-    // NSURLSession swizzle for network interception
-    // Hook the default session's dataTaskWithRequest:completionHandler:
-    // NSURLSession dataTaskWithRequest:completionHandler: is on the instance
-    Class sessionClass = [NSURLSession class];
-    Method netM = class_getInstanceMethod(sessionClass, @selector(dataTaskWithRequest:completionHandler:));
-    if (netM) {
-        orig_dataTaskWithRequest_completionHandler = (void*)method_getImplementation(netM);
-        method_setImplementation(netM, (IMP)hooked_dataTaskWithRequest_completionHandler);
-        WriteDiagnostic(@"✓ NSURLSession hooked");
-    } else {
-        WriteDiagnostic(@"✗ NSURLSession hook FAILED");
-    }
+    // Register NSURLProtocol to catch ALL HTTP traffic
+    [NSURLProtocol registerClass:[WinwalkInterceptor class]];
+    WriteDiagnostic(@"✓ NSURLProtocol registered");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
