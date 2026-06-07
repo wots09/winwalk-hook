@@ -21,50 +21,63 @@ static void Log(NSString *msg) {
     }
 }
 
-// ─── JSON helpers ───
-static void ForceSuccessAndInject(NSMutableDictionary *dict) {
-    // Force success
+// ─── JSON fixer — now handles ReturnValue/ShowsMessage/Message pattern ───
+static void FixResponse(NSMutableDictionary *dict) {
+    // Neutralize the app's error-checking pattern
+    id rv = dict[@"ReturnValue"];
+    if (rv && [rv isKindOfClass:[NSNumber class]] && [rv integerValue] < 0) {
+        Log([NSString stringWithFormat:@"  → ReturnValue=%ld overridden to 0", (long)[rv integerValue]]);
+        dict[@"ReturnValue"] = @0;
+    }
+    // Also try lowercase variant
+    rv = dict[@"returnValue"];
+    if (rv && [rv isKindOfClass:[NSNumber class]] && [rv integerValue] < 0) {
+        dict[@"returnValue"] = @0;
+    }
+    
+    // Suppress error message display
+    if (dict[@"ShowsMessage"]) dict[@"ShowsMessage"] = @NO;
+    if (dict[@"showsMessage"]) dict[@"showsMessage"] = @NO;
+    if (dict[@"Message"]) dict[@"Message"] = @"OK";
+    if (dict[@"message"]) dict[@"message"] = @"OK";
+    
+    // Standard patterns
     if (dict[@"success"]) dict[@"success"] = @YES;
     if (dict[@"isSuccess"]) dict[@"isSuccess"] = @YES;
     if (dict[@"status"]) dict[@"status"] = @200;
-    // Nullify errors
     if (dict[@"error"]) dict[@"error"] = [NSNull null];
     if (dict[@"errorCode"]) dict[@"errorCode"] = [NSNull null];
     if (dict[@"errorMessage"]) dict[@"errorMessage"] = [NSNull null];
-    if (dict[@"message"]) dict[@"message"] = @"OK";
-    if (dict[@"msg"]) dict[@"msg"] = @"OK";
     
-    // Inject coins
+    // Inject coin values
     for (NSString *key in [dict allKeys]) {
         NSString *lower = [key lowercaseString];
         if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"]) &&
             [dict[key] isKindOfClass:[NSNumber class]]) {
             dict[key] = @(kInjectedCoins);
         }
-        if ([lower isEqualToString:@"isclaimready"] || [lower isEqualToString:@"isclaimed"])
-            dict[key] = @YES;
-        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) ForceSuccessAndInject(dict[key]);
+        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) FixResponse(dict[key]);
         if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
             for (id item in (NSMutableArray *)dict[key])
-                if ([item isKindOfClass:[NSMutableDictionary class]]) ForceSuccessAndInject(item);
+                if ([item isKindOfClass:[NSMutableDictionary class]]) FixResponse(item);
         }
     }
 }
 
-static void InjectChallengeStates(id json) {
+static void FixChallengeStates(id json) {
     if ([json isKindOfClass:[NSMutableDictionary class]]) {
-        ForceSuccessAndInject((NSMutableDictionary *)json);
+        FixResponse((NSMutableDictionary *)json);
         NSMutableDictionary *dict = (NSMutableDictionary *)json;
         for (NSString *key in [dict allKeys]) {
             if ([key isEqualToString:@"isClaimReady"]) dict[key] = @YES;
             if ([key isEqualToString:@"currentCoins"]) dict[key] = @(kInjectedCoins);
             if ([key isEqualToString:@"goalCoins"]) dict[key] = @1;
             if ([key isEqualToString:@"goalSteps"]) dict[key] = @1;
-            if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) InjectChallengeStates(dict[key]);
-            if ([dict[key] isKindOfClass:[NSMutableArray class]]) InjectChallengeStates(dict[key]);
+            if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) FixChallengeStates(dict[key]);
+            if ([dict[key] isKindOfClass:[NSMutableArray class]]) FixChallengeStates(dict[key]);
         }
     } else if ([json isKindOfClass:[NSMutableArray class]]) {
-        for (id item in (NSMutableArray *)json) InjectChallengeStates(item);
+        for (id item in (NSMutableArray *)json) FixChallengeStates(item);
     }
 }
 
@@ -109,69 +122,34 @@ static void InjectChallengeStates(id json) {
     if (err) { [self.client URLProtocol:self didFailWithError:err]; return; }
     NSData *raw = [self.mData copy];
     NSString *url = self.request.URL.absoluteString;
-    NSHTTPURLResponse *http = [t.response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)t.response : nil;
-    NSInteger status = http.statusCode;
     
-    BOOL isInteresting = [url containsString:@"ClaimChallenge"] || [url containsString:@"AddUserReward"];
-    
-    // Always dump the raw response body for interesting endpoints
-    if (isInteresting && raw.length > 0) {
-        NSString *bodyStr = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-        NSString *truncated = bodyStr.length > 500 ? [[bodyStr substringToIndex:500] stringByAppendingString:@"..."] : bodyStr;
-        Log([NSString stringWithFormat:@"  RAW BODY(%ld): %@", (long)raw.length, truncated ?: @"(nil/binary)"]);
-    }
-    
-    if ([url containsString:@"ClaimChallenge"]) {
-        Log([NSString stringWithFormat:@"  ClaimChallenge: HTTP %ld", (long)status]);
-        @try {
-            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+    @try {
+        id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+        BOOL modified = NO;
+        
+        if ([url containsString:@"ClaimChallenge"] || [url containsString:@"AddUserReward"]) {
             if ([json isKindOfClass:[NSMutableDictionary class]]) {
                 NSMutableDictionary *dict = (NSMutableDictionary *)json;
-                // Log ALL keys so we know what fields exist
-                Log([NSString stringWithFormat:@"  Keys: %@", [[dict allKeys] componentsJoinedByString:@", "]]);
-                
-                ForceSuccessAndInject(dict);
-                raw = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-                
-                // Log modified response
-                NSString *mod = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-                Log([NSString stringWithFormat:@"  MODIFIED: %@", mod.length > 300 ? [[mod substringToIndex:300] stringByAppendingString:@"..."] : mod]);
+                id rv = dict[@"ReturnValue"];
+                Log([NSString stringWithFormat:@"  ReturnValue=%@, keys=%@",
+                     rv, [[dict allKeys] componentsJoinedByString:@","]]);
+                FixResponse(dict);
+                modified = YES;
             }
-        } @catch (id e) {
-            Log([NSString stringWithFormat:@"  JSON parse error: %@", e]);
+        } else if ([url containsString:@"GetUserCoins"]) {
+            if ([json isKindOfClass:[NSMutableDictionary class]]) { FixResponse(json); modified = YES; }
+        } else if ([url containsString:@"GetChallengeStates"]) {
+            if (json) { FixChallengeStates(json); modified = YES; }
         }
-    }
-    
-    if ([url containsString:@"AddUserReward"]) {
-        Log([NSString stringWithFormat:@"  AddUserReward: HTTP %ld", (long)status]);
-        @try {
-            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
-            if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                NSMutableDictionary *dict = (NSMutableDictionary *)json;
-                Log([NSString stringWithFormat:@"  Keys: %@", [[dict allKeys] componentsJoinedByString:@", "]]);
-                ForceSuccessAndInject(dict);
-                raw = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-                NSString *mod = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
-                Log([NSString stringWithFormat:@"  MODIFIED: %@", mod.length > 300 ? [[mod substringToIndex:300] stringByAppendingString:@"..."] : mod]);
+        
+        if (modified) {
+            raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            if (raw) {
+                NSString *s = [[NSString alloc] initWithData:raw encoding:NSUTF8StringEncoding];
+                Log([NSString stringWithFormat:@"  → MODIFIED: %@", s.length > 200 ? [[s substringToIndex:200] stringByAppendingString:@"..."] : s]);
             }
-        } @catch (id e) {
-            Log([NSString stringWithFormat:@"  JSON parse error: %@", e]);
         }
-    }
-    
-    if ([url containsString:@"GetUserCoins"] && raw) {
-        @try {
-            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
-            if ([json isKindOfClass:[NSMutableDictionary class]]) { ForceSuccessAndInject(json); raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil]; }
-        } @catch (id e) {}
-    }
-    
-    if ([url containsString:@"GetChallengeStates"] && raw) {
-        @try {
-            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
-            if (json) { InjectChallengeStates(json); raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil]; }
-        } @catch (id e) {}
-    }
+    } @catch (id e) {}
     
     [self.client URLProtocol:self didLoadData:raw];
     [self.client URLProtocolDidFinishLoading:self];
@@ -196,18 +174,16 @@ static id hooked_defaultCfg(Class self, SEL _cmd) { id c = orig_defaultCfg(self,
 static id hooked_ephemeralCfg(Class self, SEL _cmd) { id c = orig_ephemeralCfg(self, _cmd); InjectProtocol(c); return c; }
 static id hooked_initWithCfg(id self, SEL _cmd, id cfg) { InjectProtocol(cfg); return orig_initWithCfg(self, _cmd, cfg); }
 
-// ─── Alerts (log ALL, not just suppressed) ───
+// ─── Alerts ───
 static void (*orig_presentVC)(id, SEL, UIViewController*, BOOL, id);
 static void hooked_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
         UIAlertController *alert = (UIAlertController *)vc;
         NSString *c = [NSString stringWithFormat:@"\"%@\" / \"%@\"", alert.title ?: @"", alert.message ?: @""];
-        Log([NSString stringWithFormat:@"🔔 ALERT: %@", c]);
-        
         if ([c containsString:@"Oops"] || [c containsString:@"can't reach"] ||
             [c containsString:@"general error"] || [c containsString:@"try again later"] ||
             [c containsString:@"Need more coin"] || [c containsString:@"error occurred"]) {
-            Log(@"  → SWALLOWED");
+            Log([NSString stringWithFormat:@"🚫 Swallowed: %@", c]);
             for (UIAlertAction *a in alert.actions)
                 if (a.style == UIAlertActionStyleDefault || a.style == UIAlertActionStyleCancel) {
                     void (^h)(UIAlertAction *) = [a valueForKey:@"handler"]; if (h) { h(a); break; }
@@ -269,7 +245,7 @@ static void PatchRealm(void) {
 __attribute__((constructor))
 static void Init(void) {
     if (sDidInit) return; sDidInit = YES;
-    Log(@"========== V23 — RAW BODY DUMP ==========");
+    Log(@"========== V24 — ReturnValue NEUTRALIZER ==========");
     [NSURLProtocol registerClass:[WinwalkProtocol class]];
     Method cm1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
     orig_defaultCfg = (void*)method_getImplementation(cm1); method_setImplementation(cm1, (IMP)hooked_defaultCfg);
@@ -277,7 +253,7 @@ static void Init(void) {
     orig_ephemeralCfg = (void*)method_getImplementation(cm2); method_setImplementation(cm2, (IMP)hooked_ephemeralCfg);
     Method im = class_getInstanceMethod([NSURLSession class], @selector(initWithConfiguration:));
     orig_initWithCfg = (void*)method_getImplementation(im); method_setImplementation(im, (IMP)hooked_initWithCfg);
-    Log(@"✓ Protocol hooks");
+    Log(@"✓ Config hooks");
     Method am = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
     orig_presentVC = (void*)method_getImplementation(am); method_setImplementation(am, (IMP)hooked_presentVC);
     Method um = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
