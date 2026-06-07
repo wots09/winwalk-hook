@@ -22,7 +22,7 @@ static void Log(NSString *msg) {
 }
 
 // ─────────────────────────────────────────────────
-// Response modification helpers (plain C functions)
+// JSON injection helpers (plain C)
 // ─────────────────────────────────────────────────
 
 static void InjectCoins(NSMutableDictionary *dict) {
@@ -58,112 +58,205 @@ static void InjectChallengeStates(id json) {
 }
 
 // ─────────────────────────────────────────────────
-// 1. Response interception
+// NSURLProtocol interceptor
 // ─────────────────────────────────────────────────
 
-static id (*orig_dataTaskWithReq_completion)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*));
+@interface WinwalkProtocol : NSURLProtocol <NSURLSessionDataDelegate>
+@property (nonatomic, strong) NSMutableData *mData;
+@end
 
-static id hooked_dataTaskWithReq_completion(id self, SEL _cmd, NSURLRequest *req,
-    void(^origHandler)(NSData*, NSURLResponse*, NSError*)) {
+@implementation WinwalkProtocol
+
++ (BOOL)canInitWithRequest:(NSURLRequest *)req {
+    if (![req.URL.scheme hasPrefix:@"http"]) return NO;
+    if ([NSURLProtocol propertyForKey:@"__wp" inRequest:req]) return NO;
+    return YES;
+}
+
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)req {
+    return req;
+}
+
+- (void)startLoading {
+    NSMutableURLRequest *mr = [self.request mutableCopy];
+    [NSURLProtocol setProperty:@YES forKey:@"__wp" inRequest:mr];
     
-    NSString *url = req.URL.absoluteString;
+    NSString *url = mr.URL.absoluteString;
     
-    void(^wrappedHandler)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        NSHTTPURLResponse *httpResp = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
-        NSInteger statusCode = httpResp.statusCode;
-        
-        // ── /Challenge/ClaimChallenge ──
-        if ([url containsString:@"/Challenge/ClaimChallenge"]) {
-            Log([NSString stringWithFormat:@"🎯 ClaimChallenge: status=%ld", (long)statusCode]);
-            @try {
-                if (statusCode != 200 || err || !data) {
-                    NSString *fake = @"{\"success\":true,\"coins\":999999}";
-                    NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
-                        initWithURL:resp.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
-                        headerFields:@{@"Content-Type":@"application/json"}];
-                    Log(@"  → REPLACED with fake success");
-                    origHandler([fake dataUsingEncoding:NSUTF8StringEncoding], fakeResp, nil);
-                    return;
-                }
-                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                    InjectCoins(json);
-                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    if (newData) { origHandler(newData, resp, err); return; }
-                }
-            } @catch (id e) {}
-        }
-        
-        // ── /Reward/AddUserReward (redeem gift) ──
-        if ([url containsString:@"/Reward/AddUserReward"]) {
-            Log([NSString stringWithFormat:@"🎯 AddUserReward: status=%ld", (long)statusCode]);
-            @try {
-                if (statusCode != 200 || err || !data) {
-                    NSString *fake = @"{\"success\":true,\"rewardCode\":\"REDEEMED-999999\"}";
-                    NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
-                        initWithURL:resp.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
-                        headerFields:@{@"Content-Type":@"application/json"}];
-                    Log(@"  → REPLACED with fake success");
-                    origHandler([fake dataUsingEncoding:NSUTF8StringEncoding], fakeResp, nil);
-                    return;
-                }
-                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                    InjectCoins(json);
-                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    if (newData) { origHandler(newData, resp, err); return; }
-                }
-            } @catch (id e) {}
-        }
-        
-        // ── /User/GetUserCoins ──
-        if ([url containsString:@"/User/GetUserCoins"] && data) {
-            @try {
-                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                    InjectCoins(json);
-                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    if (newData) { Log(@"🎯 GetUserCoins: injected"); origHandler(newData, resp, err); return; }
-                }
-            } @catch (id e) {}
-        }
-        
-        // ── /Challenge/GetChallengeStates ──
-        if ([url containsString:@"/Challenge/GetChallengeStates"] && data) {
-            @try {
-                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                if (json) {
-                    InjectChallengeStates(json);
-                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    if (newData) { Log(@"🎯 GetChallengeStates: injected"); origHandler(newData, resp, err); return; }
-                }
-            } @catch (id e) {}
-        }
-        
-        origHandler(data, resp, err);
-    };
+    // Log interesting endpoints
+    if ([url containsString:@"ClaimChallenge"] || [url containsString:@"AddUserReward"] ||
+        [url containsString:@"GetUserCoins"] || [url containsString:@"GetChallengeStates"]) {
+        Log([NSString stringWithFormat:@"🎯 REQ: %@ %@", mr.HTTPMethod, url]);
+    }
     
-    return orig_dataTaskWithReq_completion(self, _cmd, req, wrappedHandler);
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.protocolClasses = nil;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg delegate:self delegateQueue:nil];
+    self.mData = [NSMutableData data];
+    [[session dataTaskWithRequest:mr] resume];
+}
+
+- (void)stopLoading {}
+
+- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t didReceiveResponse:(NSURLResponse *)r
+    completionHandler:(void (^)(NSURLSessionResponseDisposition))h {
+    [self.client URLProtocol:self didReceiveResponse:r cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+    h(NSURLSessionResponseAllow);
+}
+
+- (void)URLSession:(NSURLSession *)s dataTask:(NSURLSessionDataTask *)t didReceiveData:(NSData *)d {
+    [self.mData appendData:d];
+}
+
+- (void)URLSession:(NSURLSession *)s task:(NSURLSessionTask *)t didCompleteWithError:(NSError *)err {
+    if (err) {
+        [self.client URLProtocol:self didFailWithError:err];
+        return;
+    }
+    
+    NSData *raw = [self.mData copy];
+    NSString *url = self.request.URL.absoluteString;
+    NSHTTPURLResponse *http = [t.response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)t.response : nil;
+    NSInteger status = http.statusCode;
+    
+    // ── ClaimChallenge ──
+    if ([url containsString:@"ClaimChallenge"]) {
+        Log([NSString stringWithFormat:@"🎯 ClaimChallenge resp: status=%ld", (long)status]);
+        if (status != 200 || raw.length < 10) {
+            NSString *fake = @"{\"success\":true,\"coins\":999999}";
+            NSHTTPURLResponse *fr = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200
+                HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":@"application/json"}];
+            [self.client URLProtocol:self didReceiveResponse:fr cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:[fake dataUsingEncoding:NSUTF8StringEncoding]];
+            [self.client URLProtocolDidFinishLoading:self];
+            Log(@"  → FAKE SUCCESS injected");
+            return;
+        }
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+            if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                InjectCoins(json);
+                raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                Log(@"  → coins injected");
+            }
+        } @catch (id e) {}
+    }
+    
+    // ── AddUserReward ──
+    if ([url containsString:@"AddUserReward"]) {
+        Log([NSString stringWithFormat:@"🎯 AddUserReward resp: status=%ld", (long)status]);
+        if (status != 200 || raw.length < 10) {
+            NSString *fake = @"{\"success\":true,\"rewardCode\":\"REDEEMED\"}";
+            NSHTTPURLResponse *fr = [[NSHTTPURLResponse alloc] initWithURL:self.request.URL statusCode:200
+                HTTPVersion:@"HTTP/1.1" headerFields:@{@"Content-Type":@"application/json"}];
+            [self.client URLProtocol:self didReceiveResponse:fr cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            [self.client URLProtocol:self didLoadData:[fake dataUsingEncoding:NSUTF8StringEncoding]];
+            [self.client URLProtocolDidFinishLoading:self];
+            Log(@"  → FAKE SUCCESS injected");
+            return;
+        }
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+            if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                InjectCoins(json);
+                raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            }
+        } @catch (id e) {}
+    }
+    
+    // ── GetUserCoins ──
+    if ([url containsString:@"GetUserCoins"]) {
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+            if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                InjectCoins(json);
+                raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                Log(@"🎯 GetUserCoins: injected 999999");
+            }
+        } @catch (id e) {}
+    }
+    
+    // ── GetChallengeStates ──
+    if ([url containsString:@"GetChallengeStates"]) {
+        @try {
+            id json = [NSJSONSerialization JSONObjectWithData:raw options:NSJSONReadingMutableContainers error:nil];
+            if (json) {
+                InjectChallengeStates(json);
+                raw = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                Log(@"🎯 GetChallengeStates: injected");
+            }
+        } @catch (id e) {}
+    }
+    
+    [self.client URLProtocol:self didLoadData:raw];
+    [self.client URLProtocolDidFinishLoading:self];
+}
+
+@end
+
+// ─────────────────────────────────────────────────
+// Session config factory hooks — force protocol into EVERY session
+// ─────────────────────────────────────────────────
+
+static id (*orig_defaultCfg)(Class, SEL);
+static id (*orig_ephemeralCfg)(Class, SEL);
+static id (*orig_initWithCfg)(id, SEL, id);
+
+static id hooked_defaultCfg(Class self, SEL _cmd) {
+    id cfg = orig_defaultCfg(self, _cmd);
+    @try {
+        NSMutableArray *p = [[cfg valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+        Class wp = NSClassFromString(@"WinwalkProtocol");
+        if (wp && ![p containsObject:wp]) {
+            [p insertObject:wp atIndex:0];
+            [cfg setValue:p forKey:@"protocolClasses"];
+        }
+    } @catch (id e) {}
+    return cfg;
+}
+
+static id hooked_ephemeralCfg(Class self, SEL _cmd) {
+    id cfg = orig_ephemeralCfg(self, _cmd);
+    @try {
+        NSMutableArray *p = [[cfg valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+        Class wp = NSClassFromString(@"WinwalkProtocol");
+        if (wp && ![p containsObject:wp]) {
+            [p insertObject:wp atIndex:0];
+            [cfg setValue:p forKey:@"protocolClasses"];
+        }
+    } @catch (id e) {}
+    return cfg;
+}
+
+static id hooked_initWithCfg(id self, SEL _cmd, id cfg) {
+    @try {
+        NSMutableArray *p = [[cfg valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+        Class wp = NSClassFromString(@"WinwalkProtocol");
+        if (wp && ![p containsObject:wp]) {
+            [p insertObject:wp atIndex:0];
+            [cfg setValue:p forKey:@"protocolClasses"];
+        }
+    } @catch (id e) {}
+    return orig_initWithCfg(self, _cmd, cfg);
 }
 
 // ─────────────────────────────────────────────────
-// 2. Alert suppression
+// Alert suppression
 // ─────────────────────────────────────────────────
 
 static void (*orig_presentVC)(id, SEL, UIViewController*, BOOL, id);
 static void hooked_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
         UIAlertController *alert = (UIAlertController *)vc;
-        NSString *combined = [NSString stringWithFormat:@"%@ %@", alert.title ?: @"", alert.message ?: @""];
-        
-        if ([combined containsString:@"Oops"] || [combined containsString:@"can't reach"] ||
-            [combined containsString:@"general error"] || [combined containsString:@"try again later"] ||
-            [combined containsString:@"Need more coin"]) {
+        NSString *c = [NSString stringWithFormat:@"%@ %@", alert.title ?: @"", alert.message ?: @""];
+        if ([c containsString:@"Oops"] || [c containsString:@"can't reach"] ||
+            [c containsString:@"general error"] || [c containsString:@"try again later"] ||
+            [c containsString:@"Need more coin"]) {
             Log([NSString stringWithFormat:@"🚫 Swallowed: \"%@\"", alert.title]);
-            for (UIAlertAction *action in alert.actions) {
-                if (action.style == UIAlertActionStyleDefault || action.style == UIAlertActionStyleCancel) {
-                    void (^handler)(UIAlertAction *) = [action valueForKey:@"handler"];
-                    if (handler) { handler(action); break; }
+            for (UIAlertAction *a in alert.actions) {
+                if (a.style == UIAlertActionStyleDefault || a.style == UIAlertActionStyleCancel) {
+                    void (^h)(UIAlertAction *) = [a valueForKey:@"handler"];
+                    if (h) { h(a); break; }
                 }
             }
             return;
@@ -173,17 +266,17 @@ static void hooked_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL anima
 }
 
 // ─────────────────────────────────────────────────
-// 3. UserDefaults
+// UserDefaults
 // ─────────────────────────────────────────────────
 
-static id (*orig_ud_object)(id, SEL, NSString*);
-static id hooked_ud_object(id self, SEL _cmd, NSString *key) {
+static id (*orig_ud)(id, SEL, NSString*);
+static id hooked_ud(id self, SEL _cmd, NSString *key) {
     if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"])
         return @(kInjectedCoins);
-    return orig_ud_object(self, _cmd, key);
+    return orig_ud(self, _cmd, key);
 }
 
-static void ForceWriteUD(void) {
+static void ForceUD(void) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     for (NSString *k in @[@"totalCoin",@"totalIncomeCoins",@"weeklyLeagueCoins",
                           @"todayEarnedCoins",@"bonusCoin",@"incomeMissionCoins",
@@ -193,7 +286,7 @@ static void ForceWriteUD(void) {
 }
 
 // ─────────────────────────────────────────────────
-// 4. Realm
+// Realm
 // ─────────────────────────────────────────────────
 
 static void PatchRealm(void) {
@@ -239,42 +332,50 @@ static void PatchRealm(void) {
     } @catch (NSException *e) {}
 }
 
-// ─────────────────────────────────────────────────
-// Constructor
-// ─────────────────────────────────────────────────
-
+// ─── Constructor ───
 __attribute__((constructor))
 static void Init(void) {
     if (sDidInit) return;
     sDidInit = YES;
-    Log(@"========== V20 — RESPONSE INTERCEPTION ==========");
+    Log(@"========== V21 — NSURLPROTOCOL FACTORY HOOK ==========");
     
-    Method respM = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
-    if (respM) {
-        orig_dataTaskWithReq_completion = (void*)method_getImplementation(respM);
-        method_setImplementation(respM, (IMP)hooked_dataTaskWithReq_completion);
-        Log(@"✓ Response hook");
-    }
+    // 1. Register protocol class
+    [NSURLProtocol registerClass:[WinwalkProtocol class]];
     
-    Method alertM = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
-    if (alertM) {
-        orig_presentVC = (void*)method_getImplementation(alertM);
-        method_setImplementation(alertM, (IMP)hooked_presentVC);
-        Log(@"✓ Alert hook");
-    }
+    // 2. Hook session config factories + init
+    Method cm1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+    orig_defaultCfg = (void*)method_getImplementation(cm1);
+    method_setImplementation(cm1, (IMP)hooked_defaultCfg);
     
-    Method udM = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
-    orig_ud_object = (void*)method_getImplementation(udM);
-    method_setImplementation(udM, (IMP)hooked_ud_object);
+    Method cm2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+    orig_ephemeralCfg = (void*)method_getImplementation(cm2);
+    method_setImplementation(cm2, (IMP)hooked_ephemeralCfg);
     
+    Method im = class_getInstanceMethod([NSURLSession class], @selector(initWithConfiguration:));
+    orig_initWithCfg = (void*)method_getImplementation(im);
+    method_setImplementation(im, (IMP)hooked_initWithCfg);
+    
+    Log(@"✓ Protocol + config hooks installed");
+    
+    // 3. Alert hook
+    Method am = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
+    orig_presentVC = (void*)method_getImplementation(am);
+    method_setImplementation(am, (IMP)hooked_presentVC);
+    
+    // 4. UserDefaults
+    Method um = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
+    orig_ud = (void*)method_getImplementation(um);
+    method_setImplementation(um, (IMP)hooked_ud);
+    
+    // 5. Realm at T+12s
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 12 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
-        ForceWriteUD();
+        ForceUD();
         PatchRealm();
         [NSTimer scheduledTimerWithTimeInterval:15.0 repeats:YES block:^(NSTimer *t) {
-            ForceWriteUD();
+            ForceUD();
             PatchRealm();
         }];
-        Log(@"✓ Running");
+        Log(@"✓ All systems running");
     });
 }
