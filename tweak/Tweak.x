@@ -20,7 +20,47 @@ static void WriteDiagnostic(NSString *msg) {
 }
 
 // ─────────────────────────────────────────────────
-// NSURLProtocol subclass — intercepts ALL HTTP traffic
+// Hook NSURLSessionConfiguration — inject our protocol into EVERY session
+// ─────────────────────────────────────────────────
+
+static id (*orig_defaultConfig)(Class, SEL);
+static id (*orig_ephemeralConfig)(Class, SEL);
+
+static id hooked_defaultConfig(Class self, SEL _cmd) {
+    id config = orig_defaultConfig(self, _cmd);
+    NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+    if (![protocols containsObject:[WinwalkInterceptor class]]) {
+        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+        [config setValue:protocols forKey:@"protocolClasses"];
+        WriteDiagnostic(@"✓ Injected protocol into defaultSessionConfiguration");
+    }
+    return config;
+}
+
+static id hooked_ephemeralConfig(Class self, SEL _cmd) {
+    id config = orig_ephemeralConfig(self, _cmd);
+    NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+    if (![protocols containsObject:[WinwalkInterceptor class]]) {
+        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+        [config setValue:protocols forKey:@"protocolClasses"];
+        WriteDiagnostic(@"✓ Injected protocol into ephemeralSessionConfiguration");
+    }
+    return config;
+}
+
+// Also hook initWithConfiguration: to catch manually-created sessions
+static id (*orig_initWithConfig)(id, SEL, id);
+static id hooked_initWithConfig(id self, SEL _cmd, id config) {
+    NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
+    if (![protocols containsObject:[WinwalkInterceptor class]]) {
+        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+        [config setValue:protocols forKey:@"protocolClasses"];
+    }
+    return orig_initWithConfig(self, _cmd, config);
+}
+
+// ─────────────────────────────────────────────────
+// NSURLProtocol subclass
 // ─────────────────────────────────────────────────
 
 @interface WinwalkInterceptor : NSURLProtocol <NSURLSessionDataDelegate>
@@ -31,13 +71,8 @@ static void WriteDiagnostic(NSString *msg) {
 @implementation WinwalkInterceptor
 
 + (BOOL)canInitWithRequest:(NSURLRequest *)request {
-    // Only intercept HTTP/HTTPS
-    if (![request.URL.scheme isEqualToString:@"http"] &&
-        ![request.URL.scheme isEqualToString:@"https"]) return NO;
-    
-    // Don't intercept ourselves
-    if ([NSURLProtocol propertyForKey:@"WinwalkHandled" inRequest:request]) return NO;
-    
+    if (![request.URL.scheme hasPrefix:@"http"]) return NO;
+    if ([NSURLProtocol propertyForKey:@"__winwalk" inRequest:request]) return NO;
     return YES;
 }
 
@@ -47,29 +82,26 @@ static void WriteDiagnostic(NSString *msg) {
 
 - (void)startLoading {
     NSMutableURLRequest *mutableRequest = [self.request mutableCopy];
-    [NSURLProtocol setProperty:@YES forKey:@"WinwalkHandled" inRequest:mutableRequest];
+    [NSURLProtocol setProperty:@YES forKey:@"__winwalk" inRequest:mutableRequest];
     
-    NSString *urlStr = self.request.URL.absoluteString;
     NSString *method = self.request.HTTPMethod ?: @"GET";
-    
-    // Log ALL requests (first 200 chars of URL)
+    NSString *urlStr = self.request.URL.absoluteString;
     NSString *shortURL = urlStr.length > 200 ? [[urlStr substringToIndex:200] stringByAppendingString:@"..."] : urlStr;
+    
     WriteDiagnostic([NSString stringWithFormat:@"📡 %@ %@", method, shortURL]);
     
-    if (self.request.HTTPBody) {
+    if (self.request.HTTPBody.length > 0) {
         NSString *body = [[NSString alloc] initWithData:self.request.HTTPBody encoding:NSUTF8StringEncoding];
-        if (body.length > 0) {
-            if (body.length > 500) body = [[body substringToIndex:500] stringByAppendingString:@"..."];
-            WriteDiagnostic([NSString stringWithFormat:@"   BODY: %@", body]);
-        }
+        if (body.length > 500) body = [[body substringToIndex:500] stringByAppendingString:@"..."];
+        if (body.length > 0) WriteDiagnostic([NSString stringWithFormat:@"   BODY: %@", body]);
     }
     
-    NSURLSessionConfiguration *config = [NSURLSessionConfiguration defaultSessionConfiguration];
-    config.protocolClasses = nil; // Don't re-intercept our own requests
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:config
+    // Use a bare NSURLSession WITHOUT protocol interception for the actual network call
+    NSURLSessionConfiguration *cfg = [NSURLSessionConfiguration defaultSessionConfiguration];
+    cfg.protocolClasses = nil;  // Don't re-intercept
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:cfg
                                                           delegate:self
                                                      delegateQueue:nil];
-    
     self.mutableData = [NSMutableData data];
     self.task = [session dataTaskWithRequest:mutableRequest];
     [self.task resume];
@@ -93,66 +125,58 @@ static void WriteDiagnostic(NSString *msg) {
 - (void)URLSession:(NSURLSession *)session task:(NSURLSessionTask *)task didCompleteWithError:(NSError *)error {
     if (error) {
         [self.client URLProtocol:self didFailWithError:error];
-    } else {
-        NSData *responseData = [self.mutableData copy];
-        NSString *urlStr = self.request.URL.absoluteString;
-        
-        // Try to inject coin values into JSON responses
-        BOOL injected = NO;
-        @try {
-            id json = [NSJSONSerialization JSONObjectWithData:responseData options:NSJSONReadingMutableContainers error:nil];
-            
-            if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                NSMutableDictionary *dict = (NSMutableDictionary *)json;
-                if ([self injectCoinsIntoDict:dict]) {
-                    injected = YES;
-                    responseData = [NSJSONSerialization dataWithJSONObject:dict options:0 error:nil];
-                }
-            } else if ([json isKindOfClass:[NSMutableArray class]]) {
-                NSMutableArray *arr = (NSMutableArray *)json;
-                BOOL anyInjected = NO;
-                for (id item in arr) {
-                    if ([item isKindOfClass:[NSMutableDictionary class]]) {
-                        if ([self injectCoinsIntoDict:(NSMutableDictionary *)item]) anyInjected = YES;
-                    }
-                }
-                if (anyInjected) {
-                    injected = YES;
-                    responseData = [NSJSONSerialization dataWithJSONObject:arr options:0 error:nil];
-                }
-            }
-            
-            if (injected) {
-                WriteDiagnostic([NSString stringWithFormat:@"   ✏️ INJECTED 999999 into response: %@",
-                                 urlStr.lastPathComponent]);
-            }
-        } @catch (id e) {}
-        
-        [self.client URLProtocol:self didLoadData:responseData];
-        [self.client URLProtocolDidFinishLoading:self];
+        return;
     }
+    
+    NSData *data = [self.mutableData copy];
+    
+    // Try JSON injection
+    @try {
+        id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+        BOOL injected = NO;
+        
+        if ([json isKindOfClass:[NSMutableDictionary class]]) {
+            injected = [self injectIntoDict:(NSMutableDictionary *)json];
+        } else if ([json isKindOfClass:[NSMutableArray class]]) {
+            for (id item in (NSMutableArray *)json) {
+                if ([item isKindOfClass:[NSMutableDictionary class]]) {
+                    if ([self injectIntoDict:(NSMutableDictionary *)item]) injected = YES;
+                }
+            }
+        }
+        
+        if (injected) {
+            data = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+            WriteDiagnostic([NSString stringWithFormat:@"   ✏️ INJECTED coins to 999999"]);
+        }
+    } @catch (id e) {}
+    
+    [self.client URLProtocol:self didLoadData:data];
+    [self.client URLProtocolDidFinishLoading:self];
 }
 
-- (BOOL)injectCoinsIntoDict:(NSMutableDictionary *)dict {
+- (BOOL)injectIntoDict:(NSMutableDictionary *)dict {
     BOOL found = NO;
     for (NSString *key in [dict allKeys]) {
         NSString *lower = key.lowercaseString;
-        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"]) &&
-            [dict[key] isKindOfClass:[NSNumber class]]) {
+        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower hasSuffix:@"point"]) &&
+            [dict[key] isKindOfClass:[NSNumber class]] &&
+            ![key.lowercaseString containsString:@"video"] &&
+            ![key.lowercaseString containsString:@"mission"]) {
             NSInteger cv = [dict[key] integerValue];
             if (cv != kInjectedCoins && cv != 0) {
                 dict[key] = @(kInjectedCoins);
+                WriteDiagnostic([NSString stringWithFormat:@"   coin key: %@ = %ld → 999999", key, (long)cv]);
                 found = YES;
             }
         }
-        // Recurse into nested dicts
         if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) {
-            if ([self injectCoinsIntoDict:(NSMutableDictionary *)dict[key]]) found = YES;
+            if ([self injectIntoDict:dict[key]]) found = YES;
         }
         if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
             for (id item in (NSMutableArray *)dict[key]) {
                 if ([item isKindOfClass:[NSMutableDictionary class]]) {
-                    if ([self injectCoinsIntoDict:(NSMutableDictionary *)item]) found = YES;
+                    if ([self injectIntoDict:item]) found = YES;
                 }
             }
         }
@@ -171,23 +195,24 @@ static NSInteger (*orig_integerForKey)(id, SEL, NSString*);
 static NSDictionary* (*orig_dictionaryRepresentation)(id, SEL);
 
 static id hooked_objectForKey(id self, SEL _cmd, NSString *key) {
-    NSString *lower = key.lowercaseString;
-    if ([lower containsString:@"coin"] || [lower containsString:@"balance"]) return @(kInjectedCoins);
+    if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"])
+        return @(kInjectedCoins);
     return orig_objectForKey(self, _cmd, key);
 }
 
 static NSInteger hooked_integerForKey(id self, SEL _cmd, NSString *key) {
-    NSString *lower = key.lowercaseString;
-    if ([lower containsString:@"coin"] || [lower containsString:@"balance"]) return kInjectedCoins;
+    if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"])
+        return kInjectedCoins;
     return orig_integerForKey(self, _cmd, key);
 }
 
 static NSDictionary* hooked_dictionaryRepresentation(id self, SEL _cmd) {
     NSMutableDictionary *dict = [orig_dictionaryRepresentation(self, _cmd) mutableCopy];
     for (NSString *key in [dict allKeys]) {
-        if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"]) dict[key] = @(kInjectedCoins);
+        if ([key.lowercaseString containsString:@"coin"] || [key.lowercaseString containsString:@"balance"])
+            dict[key] = @(kInjectedCoins);
     }
-    return [dict copy];
+    return dict;
 }
 
 static void ForceWriteUserDefaults(void) {
@@ -224,19 +249,19 @@ static void PatchRealmDB(void) {
             id prop = ((id (*)(id, SEL, unsigned long))objc_msgSend)(props, sel_getUid("objectAtIndex:"), j);
             NSString *name = ((id (*)(id, SEL))objc_msgSend)(prop, sel_getUid("name"));
             NSString *l = name.lowercaseString;
-            if ([l containsString:@"currentcoins"] || [l isEqualToString:@"coins"] || [l hasSuffix:@"coins"]) kv[name] = @(kInjectedCoins);
-            else if ([l isEqualToString:@"step"]) kv[name] = @100000;
-            else if ([l isEqualToString:@"distance"]) kv[name] = @80.0;
-            else if ([l isEqualToString:@"calories"]) kv[name] = @500;
-            else if ([l isEqualToString:@"activetime"]) kv[name] = @7200;
+            if ([l containsString:@"currentcoins"] || [l isEqualToString:@"coins"] || [l hasSuffix:@"coins"]) kv[name]=@(kInjectedCoins);
+            else if ([l isEqualToString:@"step"]) kv[name]=@100000;
+            else if ([l isEqualToString:@"distance"]) kv[name]=@80.0;
+            else if ([l isEqualToString:@"calories"]) kv[name]=@500;
+            else if ([l isEqualToString:@"activetime"]) kv[name]=@7200;
         }
         if (!kv.count) continue;
         id results = ((id (*)(id, SEL, NSString*, NSString*))objc_msgSend)(realm, sel_getUid("objects:where:"), cn, nil);
         unsigned long oc = ((unsigned long (*)(id, SEL))objc_msgSend)(results, sel_getUid("count"));
         for (unsigned long k = 0; k < oc; k++) {
             id obj = ((id (*)(id, SEL, unsigned long))objc_msgSend)(results, sel_getUid("objectAtIndex:"), k);
-            for (NSString *key in kv) {
-                @try { ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), kv[key], key); }
+            for (NSString *k2 in kv) {
+                @try { ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), kv[k2], k2); }
                 @catch (id e) {}
             }
         }
@@ -247,7 +272,7 @@ static void PatchRealmDB(void) {
 // ─── Constructor ───
 __attribute__((constructor))
 static void Init(void) {
-    WriteDiagnostic(@"========== V12 — NSURLProtocol INTERCEPTOR ==========");
+    WriteDiagnostic(@"========== V13 — SESSION FACTORY HOOK ==========");
     
     // UserDefaults swizzles
     Method m1 = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
@@ -262,7 +287,21 @@ static void Init(void) {
     orig_dictionaryRepresentation = (void*)method_getImplementation(m3);
     method_setImplementation(m3, (IMP)hooked_dictionaryRepresentation);
     
-    // Register NSURLProtocol to catch ALL HTTP traffic
+    // Hook NSURLSessionConfiguration factories — forces our protocol into EVERY session
+    Method cm1 = class_getClassMethod([NSURLSessionConfiguration class], @selector(defaultSessionConfiguration));
+    orig_defaultConfig = (void*)method_getImplementation(cm1);
+    method_setImplementation(cm1, (IMP)hooked_defaultConfig);
+    
+    Method cm2 = class_getClassMethod([NSURLSessionConfiguration class], @selector(ephemeralSessionConfiguration));
+    orig_ephemeralConfig = (void*)method_getImplementation(cm2);
+    method_setImplementation(cm2, (IMP)hooked_ephemeralConfig);
+    
+    // Hook NSURLSession initWithConfiguration: to catch manually-created configs
+    Method im = class_getInstanceMethod([NSURLSession class], @selector(initWithConfiguration:));
+    orig_initWithConfig = (void*)method_getImplementation(im);
+    method_setImplementation(im, (IMP)hooked_initWithConfig);
+    
+    WriteDiagnostic(@"✓ NSURLSessionConfiguration factories hooked");
     [NSURLProtocol registerClass:[WinwalkInterceptor class]];
     WriteDiagnostic(@"✓ NSURLProtocol registered");
     
