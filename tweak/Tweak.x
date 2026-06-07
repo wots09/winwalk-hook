@@ -69,11 +69,6 @@ static void PatchRealmDB(void) {
     
     id realm = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultRealm"));
     if (!realm) {
-        // Try to get realm from configuration
-        id config = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultConfiguration"));
-        if (config) {
-            realm = ((id (*)(Class, SEL, id))objc_msgSend)(realmClass, sel_getUid("realmWithConfiguration:error:"), config, NULL);
-        }
         if (!realm) {
             WriteDiagnostic(@"FATAL: Cannot obtain Realm instance — DB not initialized yet");
             return;
