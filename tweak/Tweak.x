@@ -1,8 +1,6 @@
 #import <Foundation/Foundation.h>
-#import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-#import <fishhook/fishhook.h>
 
 static const NSInteger kInjectedCoins = 999999;
 
@@ -19,127 +17,136 @@ static void WriteDiagnostic(NSString *msg) {
         [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
         [fh closeFile];
     }
-    NSLog(@"%@", line);
 }
 
-static void DumpCoinClasses(void) {
+// ─── Find the REAL class name (Objective-C runtime uses Swift module prefix) ───
+static NSArray *FindRealmCoinClasses(void) {
+    NSMutableArray *found = [NSMutableArray array];
     unsigned int count = 0;
     Class *all = objc_copyClassList(&count);
-    NSMutableString *found = [NSMutableString string];
     for (unsigned int i = 0; i < count; i++) {
         NSString *name = NSStringFromClass(all[i]);
-        if ([name.lowercaseString containsString:@"coin"] || 
-            [name.lowercaseString containsString:@"step"] ||
-            [name.lowercaseString containsString:@"challenge"] ||
-            [name.lowercaseString containsString:@"reward"] ||
-            [name containsString:@"Realm"]) {
-            [found appendFormat:@"  %@\n", name];
+        // Match Realm model classes from winwalk — they all have "winwalk.Realm" prefix
+        if ([name hasPrefix:@"winwalk.Realm"]) {
+            [found addObject:name];
         }
     }
     free(all);
-    WriteDiagnostic([NSString stringWithFormat:@"Relevant classes:\n%@", found]);
+    return found;
 }
 
-static NSInteger hookedCoinsGetter(id self, SEL _cmd) { return kInjectedCoins; }
-static NSInteger hookedCurrentCoinsGetter(id self, SEL _cmd) { return kInjectedCoins; }
-static NSInteger hookedStepGetter(id self, SEL _cmd) { return 99999900; }
-
-static void swizzleGetterIfExists(Class cls, SEL originalSel, IMP newImp, NSMutableString *log) {
-    Method m = class_getInstanceMethod(cls, originalSel);
-    if (m) {
-        method_setImplementation(m, (IMP)newImp);
-        [log appendFormat:@"  + %@.%@\n", NSStringFromClass(cls), NSStringFromSelector(originalSel)];
-    }
-}
-
-static void swizzleAllCoinClasses(void) {
-    NSArray *selectors = @[@"coins", @"currentCoins", @"step", @"value",
-                           @"coinBalance", @"coinValue", @"rewardCoins", 
-                           @"currentStep", @"remainingCoin"];
-    IMP coinImp = (IMP)hookedCoinsGetter;
-    IMP curImp = (IMP)hookedCurrentCoinsGetter;
-    IMP stepImp = (IMP)hookedStepGetter;
-    
-    NSMutableString *log = [NSMutableString string];
-    unsigned int classCount = 0;
-    Class *allClasses = objc_copyClassList(&classCount);
-    
-    for (unsigned int i = 0; i < classCount; i++) {
-        Class cls = allClasses[i];
-        NSString *cname = NSStringFromClass(cls);
-        if ([cname containsString:@"winwalk"] || [cname containsString:@"Winwalk"] || [cname containsString:@"Realm"]) {
-            for (NSString *selName in selectors) {
-                SEL sel = NSSelectorFromString(selName);
-                if ([selName isEqualToString:@"step"] || [selName isEqualToString:@"currentStep"])
-                    swizzleGetterIfExists(cls, sel, stepImp, log);
-                else if ([selName containsString:@"currentCoins"] || [selName containsString:@"remainingCoin"])
-                    swizzleGetterIfExists(cls, sel, curImp, log);
-                else
-                    swizzleGetterIfExists(cls, sel, coinImp, log);
-            }
+// ─── Dump all properties of a Realm object to find coin-related keys ───
+static NSArray *FindCoinPropertyNames(Class cls) {
+    NSMutableArray *keys = [NSMutableArray array];
+    unsigned int propCount = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &propCount);
+    for (unsigned int i = 0; i < propCount; i++) {
+        NSString *pname = [NSString stringWithUTF8String:property_getName(props[i])];
+        NSString *lower = pname.lowercaseString;
+        if ([lower containsString:@"coin"] || [lower containsString:@"step"] || 
+            [lower containsString:@"balance"] || [lower containsString:@"reward"]) {
+            [keys addObject:pname];
         }
     }
-    free(allClasses);
-    WriteDiagnostic([NSString stringWithFormat:@"Swizzled:\n%@", log]);
+    free(props);
+    return keys;
 }
 
-static NSInteger rep_coins(void) { return kInjectedCoins; }
-
-static void installFishHooksDelayed(void) {
-    WriteDiagnostic(@"fishhook: installing 6 rebindings...");
-    struct rebinding rebindings[] = {
-        {"_$s7winwalk11CoinBalanceV5coinsSivg",             (void*)rep_coins, NULL},
-        {"_$s7winwalk14StepCoinsQueryV5coinsSivg",          (void*)rep_coins, NULL},
-        {"_$s7winwalk13StepCoinBonusV5coinsSivg",           (void*)rep_coins, NULL},
-        {"_$s7winwalk14ChallengeStateV12currentCoinsSivg",  (void*)rep_coins, NULL},
-        {"_$s7winwalk9ChallengeV5coinsSivg",                (void*)rep_coins, NULL},
-        {"_$s7winwalk9ChallengeV12currentCoinsSivg",        (void*)rep_coins, NULL},
-    };
-    int count = sizeof(rebindings) / sizeof(struct rebinding);
-    int result = rebind_symbols(rebindings, count);
-    WriteDiagnostic([NSString stringWithFormat:@"fishhook: ret=%d (0=OK)", result]);
+static void PatchRealmDB(void) {
+    WriteDiagnostic(@"─── Realm DB Patch Cycle ───");
     
-    // Test each replacement function directly (proves they return 999999)
-    WriteDiagnostic([NSString stringWithFormat:@"Test rep_coins()=%ld", (long)rep_coins()]);
-}
-
-static void patchRealmDB(void) {
+    // Step 1: Find all Realm classes
+    NSArray *realmClasses = FindRealmCoinClasses();
+    WriteDiagnostic([NSString stringWithFormat:@"Found %lu Realm classes: %@", 
+                     (unsigned long)realmClasses.count, realmClasses]);
+    
+    // Step 2: Get default Realm
     Class realmClass = NSClassFromString(@"RLMRealm");
-    if (!realmClass) { WriteDiagnostic(@"Realm: RLMRealm NOT found"); return; }
-    id realm = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultRealm"));
-    if (!realm) { WriteDiagnostic(@"Realm: defaultRealm=nil"); return; }
-    ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
-    NSArray *cn = @[@"RealmChallengeItem",@"RealmRewardItem",@"RealmStreakChallengeItem",@"RealmDailyStepModel"];
-    NSArray *keys = @[@"coins",@"currentCoins",@"step"];
-    NSArray *vals = @[@(kInjectedCoins),@(kInjectedCoins),@99999900];
-    NSMutableString *dbLog = [NSMutableString string];
-    for (NSString *c in cn) {
-        Class mc = NSClassFromString(c);
-        if (!mc) { [dbLog appendFormat:@"  %@ MISSING\n", c]; continue; }
-        id results = ((id (*)(Class,SEL,id))objc_msgSend)(mc, sel_getUid("allObjectsInRealm:"), realm);
-        if (!results) { [dbLog appendFormat:@"  %@: no results\n", c]; continue; }
-        id it = ((id (*)(id,SEL))objc_msgSend)(results, sel_getUid("objectEnumerator"));
-        if (!it) continue;
-        int n = 0; id obj;
-        while ((obj = ((id (*)(id,SEL))objc_msgSend)(it, sel_getUid("nextObject")))) {
-            for (int j=0;j<3;j++) @try{((void(*)(id,SEL,id,id))objc_msgSend)(obj,sel_getUid("setValue:forKey:"),vals[j],keys[j]);}@catch(id e){}
-            n++;
-        }
-        [dbLog appendFormat:@"  %@: %d objects\n", c, n];
+    if (!realmClass) {
+        WriteDiagnostic(@"FATAL: RLMRealm not found — Realm framework may not be loaded yet");
+        return;
     }
+    
+    id realm = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultRealm"));
+    if (!realm) {
+        // Try to get realm from configuration
+        id config = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultConfiguration"));
+        if (config) {
+            realm = ((id (*)(Class, SEL, id))objc_msgSend)(realmClass, sel_getUid("realmWithConfiguration:error:"), config, NULL);
+        }
+        if (!realm) {
+            WriteDiagnostic(@"FATAL: Cannot obtain Realm instance — DB not initialized yet");
+            return;
+        }
+    }
+    WriteDiagnostic(@"Realm instance obtained ✓");
+    
+    // Step 3: Begin write transaction
+    ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
+    
+    int totalPatched = 0;
+    
+    for (NSString *className in realmClasses) {
+        Class cls = NSClassFromString(className);
+        if (!cls) continue;
+        
+        // Find coin-related properties on this class
+        NSArray *coinProps = FindCoinPropertyNames(cls);
+        if (coinProps.count == 0) {
+            WriteDiagnostic([NSString stringWithFormat:@"  %@ — no coin properties", className]);
+            continue;
+        }
+        
+        WriteDiagnostic([NSString stringWithFormat:@"  %@ coin props: %@", className, coinProps]);
+        
+        // Get all objects of this class
+        id results = ((id (*)(Class, SEL, id))objc_msgSend)(cls, sel_getUid("allObjectsInRealm:"), realm);
+        if (!results) continue;
+        
+        id enumerator = ((id (*)(id, SEL))objc_msgSend)(results, sel_getUid("objectEnumerator"));
+        if (!enumerator) continue;
+        
+        int objCount = 0;
+        id obj;
+        while ((obj = ((id (*)(id, SEL))objc_msgSend)(enumerator, sel_getUid("nextObject")))) {
+            for (NSString *key in coinProps) {
+                NSNumber *val = nil;
+                if ([key.lowercaseString containsString:@"step"]) {
+                    val = @99999900;
+                } else {
+                    val = @(kInjectedCoins);
+                }
+                @try {
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), val, key);
+                } @catch (id e) {
+                    WriteDiagnostic([NSString stringWithFormat:@"    ERROR setting %@.%@ = %@", className, key, e]);
+                }
+            }
+            objCount++;
+        }
+        totalPatched += objCount;
+        WriteDiagnostic([NSString stringWithFormat:@"  %@: patched %d objects", className, objCount]);
+    }
+    
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("commitWriteTransaction"));
-    WriteDiagnostic([NSString stringWithFormat:@"Realm patch:\n%@", dbLog]);
+    WriteDiagnostic([NSString stringWithFormat:@"TOTAL: %d objects patched across %lu classes", 
+                     totalPatched, (unsigned long)realmClasses.count]);
 }
 
 __attribute__((constructor))
 static void WinwalkHackInit(void) {
-    WriteDiagnostic(@"========== WINWALK HACK V3 LOADED ==========");
-    WriteDiagnostic([NSString stringWithFormat:@"Target coins: %ld", (long)kInjectedCoins]);
-    DumpCoinClasses();
-    swizzleAllCoinClasses();
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3*NSEC_PER_SEC), dispatch_get_main_queue(), ^{
-        installFishHooksDelayed();
+    WriteDiagnostic(@"========== WINWALK HACK V4 — REALM DB PATCHER ==========");
+    WriteDiagnostic([NSString stringWithFormat:@"Target coins: %ld steps: 99999900", (long)kInjectedCoins]);
+    
+    // Run Realm patch on a delay to ensure DB is initialized
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        PatchRealmDB();
+        // Then run every 10 seconds
+        [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t) {
+            PatchRealmDB();
+        }];
     });
-    [NSTimer scheduledTimerWithTimeInterval:10.0 repeats:YES block:^(NSTimer *t){ patchRealmDB(); }];
-    WriteDiagnostic(@"Init complete.");
+    
+    WriteDiagnostic(@"Init complete — Realm patcher scheduled at T+5s");
 }

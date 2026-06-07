@@ -1,4 +1,4 @@
-name: Build + Inject + Repack IPA
+name: Build V4 Realm Patcher
 
 on:
   push:
@@ -11,71 +11,28 @@ env:
 jobs:
   build:
     runs-on: macos-latest
-    
     steps:
       - uses: actions/checkout@v5
-      
       - name: Install Theos
         run: |
           export THEOS=/Users/runner/theos
           echo "THEOS=/Users/runner/theos" >> $GITHUB_ENV
           git clone --depth 1 --recursive https://github.com/theos/theos.git $THEOS
           brew install ldid
-      
-      - name: Install iOS SDK from Xcode
+      - name: Install iOS SDK
         run: |
           XCODE_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           mkdir -p "$THEOS/sdks"
           ditto "$XCODE_SDK" "$THEOS/sdks/iPhoneOS18.4.sdk"
-      
-      - name: Copy fishhook into project
-        run: |
-          mkdir -p $THEOS/include/fishhook
-          cp $THEOS/vendor/orion/fishhook/fishhook.h $THEOS/include/fishhook/
-          cp $THEOS/vendor/orion/fishhook/fishhook.h tweak/
-          cp $THEOS/vendor/orion/fishhook/fishhook.c tweak/
-      
-      - name: Build WinwalkHook.dylib
+      - name: Build
         run: |
           cd tweak
           export THEOS=/Users/runner/theos
           make clean
           make
           find . -name "WinwalkHook.dylib" -type f -exec cp {} ../WinwalkHook.dylib \;
-          echo "Dylib built:"
           file ../WinwalkHook.dylib
-      
-      - name: Build insert_dylib
-        run: |
-          git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
-          cd /tmp/insert_dylib
-          xcodebuild -project insert_dylib.xcodeproj -target insert_dylib -configuration Release -sdk macosx
-          cp build/Release/insert_dylib /Users/runner/work/winwalk-hook/winwalk-hook/
-      
-      - name: Copy dylib + inject into binary
-        run: |
-          cp WinwalkHook.dylib app/Payload/winwalk.app/
-          ./insert_dylib @executable_path/WinwalkHook.dylib app/Payload/winwalk.app/winwalk --all-yes
-          # insert_dylib outputs winwalk_patched — replace original with patched
-          mv app/Payload/winwalk.app/winwalk_patched app/Payload/winwalk.app/winwalk
-          echo "Injection done. Load commands:"
-          otool -L app/Payload/winwalk.app/winwalk | grep -i hook || echo "(otool unavailable, but injection succeeded)"
-      
-      - name: Repack IPA
-        run: |
-          cd app
-          zip -qr ../winwalk_hooked.ipa Payload/
-          cd ..
-          ls -la winwalk_hooked.ipa
-      
-      - name: Upload hooked IPA
-        uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v5
         with:
-          name: winwalk_hooked.ipa
-          path: winwalk_hooked.ipa
-      
-      - name: Upload dylib only (backup)
-        uses: actions/upload-artifact@v5
-        with:
-          name: WinwalkHook.dylib
+          name: WinwalkHook_v4.dylib
           path: WinwalkHook.dylib
