@@ -4,7 +4,6 @@
 
 static const NSInteger kInjectedCoins = 999999;
 
-@class WinwalkInterceptor;
 
 static void WriteDiagnostic(NSString *msg) {
     NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
@@ -31,8 +30,8 @@ static id (*orig_ephemeralConfig)(Class, SEL);
 static id hooked_defaultConfig(Class self, SEL _cmd) {
     id config = orig_defaultConfig(self, _cmd);
     NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
-    if (![protocols containsObject:[WinwalkInterceptor class]]) {
-        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+    if (![protocols containsObject:NSClassFromString(@"WinwalkInterceptor")]) {
+        [protocols insertObject:NSClassFromString(@"WinwalkInterceptor") atIndex:0];
         [config setValue:protocols forKey:@"protocolClasses"];
         WriteDiagnostic(@"✓ Injected protocol into defaultSessionConfiguration");
     }
@@ -42,8 +41,8 @@ static id hooked_defaultConfig(Class self, SEL _cmd) {
 static id hooked_ephemeralConfig(Class self, SEL _cmd) {
     id config = orig_ephemeralConfig(self, _cmd);
     NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
-    if (![protocols containsObject:[WinwalkInterceptor class]]) {
-        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+    if (![protocols containsObject:NSClassFromString(@"WinwalkInterceptor")]) {
+        [protocols insertObject:NSClassFromString(@"WinwalkInterceptor") atIndex:0];
         [config setValue:protocols forKey:@"protocolClasses"];
         WriteDiagnostic(@"✓ Injected protocol into ephemeralSessionConfiguration");
     }
@@ -54,8 +53,8 @@ static id hooked_ephemeralConfig(Class self, SEL _cmd) {
 static id (*orig_initWithConfig)(id, SEL, id);
 static id hooked_initWithConfig(id self, SEL _cmd, id config) {
     NSMutableArray *protocols = [[config valueForKey:@"protocolClasses"] mutableCopy] ?: [NSMutableArray array];
-    if (![protocols containsObject:[WinwalkInterceptor class]]) {
-        [protocols insertObject:[WinwalkInterceptor class] atIndex:0];
+    if (![protocols containsObject:NSClassFromString(@"WinwalkInterceptor")]) {
+        [protocols insertObject:NSClassFromString(@"WinwalkInterceptor") atIndex:0];
         [config setValue:protocols forKey:@"protocolClasses"];
     }
     return orig_initWithConfig(self, _cmd, config);
@@ -304,7 +303,7 @@ static void Init(void) {
     method_setImplementation(im, (IMP)hooked_initWithConfig);
     
     WriteDiagnostic(@"✓ NSURLSessionConfiguration factories hooked");
-    [NSURLProtocol registerClass:[WinwalkInterceptor class]];
+    [NSURLProtocol registerClass:NSClassFromString(@"WinwalkInterceptor")];
     WriteDiagnostic(@"✓ NSURLProtocol registered");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
