@@ -69,7 +69,7 @@ static void PatchRealmDB(void) {
     
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
     
-    int totalSets = 0;
+    
     
     for (unsigned long i = 0; i < schemaCount; i++) {
         id schemaObj = ((id (*)(id, SEL, unsigned long))objc_msgSend)(objectSchemas, sel_getUid("objectAtIndex:"), i);
@@ -107,7 +107,7 @@ static void PatchRealmDB(void) {
             for (NSString *key in keyValues) {
                 @try {
                     ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), keyValues[key], key);
-                    totalSets++;
+                    
                 } @catch (id e) {}
             }
         }
