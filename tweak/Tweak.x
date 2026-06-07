@@ -22,7 +22,43 @@ static void Log(NSString *msg) {
 }
 
 // ─────────────────────────────────────────────────
-// 1. Response interception — hook dataTaskWithRequest:completionHandler:
+// Response modification helpers (plain C functions)
+// ─────────────────────────────────────────────────
+
+static void InjectCoins(NSMutableDictionary *dict) {
+    for (NSString *key in [dict allKeys]) {
+        NSString *lower = [key lowercaseString];
+        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"]) &&
+            [dict[key] isKindOfClass:[NSNumber class]] && [dict[key] integerValue] != kInjectedCoins) {
+            dict[key] = @(kInjectedCoins);
+        }
+        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) InjectCoins(dict[key]);
+        if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
+            for (id item in (NSMutableArray *)dict[key])
+                if ([item isKindOfClass:[NSMutableDictionary class]]) InjectCoins(item);
+        }
+    }
+}
+
+static void InjectChallengeStates(id json) {
+    if ([json isKindOfClass:[NSMutableDictionary class]]) {
+        NSMutableDictionary *dict = (NSMutableDictionary *)json;
+        for (NSString *key in [dict allKeys]) {
+            if ([key isEqualToString:@"isClaimReady"]) dict[key] = @YES;
+            if ([key isEqualToString:@"currentCoins"]) dict[key] = @(kInjectedCoins);
+            if ([key isEqualToString:@"goalCoins"]) dict[key] = @1;
+            if ([key isEqualToString:@"goalSteps"]) dict[key] = @1;
+            InjectCoins(dict);
+            if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) InjectChallengeStates(dict[key]);
+            if ([dict[key] isKindOfClass:[NSMutableArray class]]) InjectChallengeStates(dict[key]);
+        }
+    } else if ([json isKindOfClass:[NSMutableArray class]]) {
+        for (id item in (NSMutableArray *)json) InjectChallengeStates(item);
+    }
+}
+
+// ─────────────────────────────────────────────────
+// 1. Response interception
 // ─────────────────────────────────────────────────
 
 static id (*orig_dataTaskWithReq_completion)(id, SEL, NSURLRequest*, void(^)(NSData*, NSURLResponse*, NSError*));
@@ -33,7 +69,6 @@ static id hooked_dataTaskWithReq_completion(id self, SEL _cmd, NSURLRequest *req
     NSString *url = req.URL.absoluteString;
     
     void(^wrappedHandler)(NSData*, NSURLResponse*, NSError*) = ^(NSData *data, NSURLResponse *resp, NSError *err) {
-        
         NSHTTPURLResponse *httpResp = [resp isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)resp : nil;
         NSInteger statusCode = httpResp.statusCode;
         
@@ -41,28 +76,22 @@ static id hooked_dataTaskWithReq_completion(id self, SEL _cmd, NSURLRequest *req
         if ([url containsString:@"/Challenge/ClaimChallenge"]) {
             Log([NSString stringWithFormat:@"🎯 ClaimChallenge: status=%ld", (long)statusCode]);
             @try {
-                // If server returned error, replace with fake success
                 if (statusCode != 200 || err || !data) {
                     NSString *fake = @"{\"success\":true,\"coins\":999999}";
                     NSHTTPURLResponse *fakeResp = [[NSHTTPURLResponse alloc]
                         initWithURL:resp.URL statusCode:200 HTTPVersion:@"HTTP/1.1"
                         headerFields:@{@"Content-Type":@"application/json"}];
-                    Log(@"  → REPLACED with fake success response");
+                    Log(@"  → REPLACED with fake success");
                     origHandler([fake dataUsingEncoding:NSUTF8StringEncoding], fakeResp, nil);
                     return;
                 }
-                // If success but wrong coin value, inject 999999
                 id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
                 if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                    [self injectCoins:json];
+                    InjectCoins(json);
                     NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    Log(@"  → Coins injected into success response");
-                    origHandler(newData, resp, err);
-                    return;
+                    if (newData) { origHandler(newData, resp, err); return; }
                 }
-            } @catch (id e) {
-                Log([NSString stringWithFormat:@"  ClaimChallenge error: %@", e]);
-            }
+            } @catch (id e) {}
         }
         
         // ── /Reward/AddUserReward (redeem gift) ──
@@ -80,117 +109,61 @@ static id hooked_dataTaskWithReq_completion(id self, SEL _cmd, NSURLRequest *req
                 }
                 id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
                 if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                    [self injectCoins:json];
+                    InjectCoins(json);
                     NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                    origHandler(newData, resp, err);
-                    return;
+                    if (newData) { origHandler(newData, resp, err); return; }
                 }
-            } @catch (id e) {
-                Log([NSString stringWithFormat:@"  AddUserReward error: %@", e]);
-            }
+            } @catch (id e) {}
         }
         
         // ── /User/GetUserCoins ──
-        if ([url containsString:@"/User/GetUserCoins"]) {
+        if ([url containsString:@"/User/GetUserCoins"] && data) {
             @try {
-                if (data) {
-                    id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                    if ([json isKindOfClass:[NSMutableDictionary class]]) {
-                        [self injectCoins:json];
-                        NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                        Log(@"🎯 GetUserCoins: injected 999999");
-                        origHandler(newData, resp, err);
-                        return;
-                    }
+                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if ([json isKindOfClass:[NSMutableDictionary class]]) {
+                    InjectCoins(json);
+                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                    if (newData) { Log(@"🎯 GetUserCoins: injected"); origHandler(newData, resp, err); return; }
                 }
             } @catch (id e) {}
         }
         
         // ── /Challenge/GetChallengeStates ──
-        if ([url containsString:@"/Challenge/GetChallengeStates"]) {
+        if ([url containsString:@"/Challenge/GetChallengeStates"] && data) {
             @try {
-                if (data) {
-                    id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
-                    if (json) {
-                        [self injectChallengeStates:json];
-                        NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
-                        Log(@"🎯 GetChallengeStates: injected isClaimReady + coins");
-                        origHandler(newData, resp, err);
-                        return;
-                    }
+                id json = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:nil];
+                if (json) {
+                    InjectChallengeStates(json);
+                    NSData *newData = [NSJSONSerialization dataWithJSONObject:json options:0 error:nil];
+                    if (newData) { Log(@"🎯 GetChallengeStates: injected"); origHandler(newData, resp, err); return; }
                 }
             } @catch (id e) {}
         }
         
-        // Pass through unchanged
         origHandler(data, resp, err);
     };
     
     return orig_dataTaskWithReq_completion(self, _cmd, req, wrappedHandler);
 }
 
-// Helper: recursively inject coin values into any dict
-- (void)injectCoins:(NSMutableDictionary *)dict {
-    for (NSString *key in [dict allKeys]) {
-        NSString *lower = [key lowercaseString];
-        if (([lower containsString:@"coin"] || [lower containsString:@"balance"] || [lower isEqualToString:@"point"]) &&
-            [dict[key] isKindOfClass:[NSNumber class]] && [dict[key] integerValue] != kInjectedCoins) {
-            dict[key] = @(kInjectedCoins);
-        }
-        if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) [self injectCoins:dict[key]];
-        if ([dict[key] isKindOfClass:[NSMutableArray class]]) {
-            for (id item in (NSMutableArray *)dict[key])
-                if ([item isKindOfClass:[NSMutableDictionary class]]) [self injectCoins:item];
-        }
-    }
-}
-
-// Helper: inject challenge completion into array of challenge states
-- (void)injectChallengeStates:(id)json {
-    if ([json isKindOfClass:[NSMutableDictionary class]]) {
-        NSMutableDictionary *dict = (NSMutableDictionary *)json;
-        for (NSString *key in [dict allKeys]) {
-            if ([key isEqualToString:@"isClaimReady"]) dict[key] = @YES;
-            if ([key isEqualToString:@"currentCoins"]) dict[key] = @(kInjectedCoins);
-            if ([key isEqualToString:@"goalCoins"]) dict[key] = @1;
-            if ([key isEqualToString:@"goalSteps"]) dict[key] = @1;
-            [self injectCoins:dict]; // also inject any coin fields
-            if ([dict[key] isKindOfClass:[NSMutableDictionary class]]) [self injectChallengeStates:dict[key]];
-            if ([dict[key] isKindOfClass:[NSMutableArray class]]) [self injectChallengeStates:dict[key]];
-        }
-    } else if ([json isKindOfClass:[NSMutableArray class]]) {
-        for (id item in (NSMutableArray *)json)
-            [self injectChallengeStates:item];
-    }
-}
-
 // ─────────────────────────────────────────────────
-// 2. Alert suppression (broader match)
+// 2. Alert suppression
 // ─────────────────────────────────────────────────
 
 static void (*orig_presentVC)(id, SEL, UIViewController*, BOOL, id);
 static void hooked_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
     if ([vc isKindOfClass:[UIAlertController class]]) {
         UIAlertController *alert = (UIAlertController *)vc;
-        NSString *title = alert.title ?: @"";
-        NSString *msg = alert.message ?: @"";
-        NSString *combined = [[title stringByAppendingString:@" "] stringByAppendingString:msg];
+        NSString *combined = [NSString stringWithFormat:@"%@ %@", alert.title ?: @"", alert.message ?: @""];
         
-        if ([combined containsString:@"Oops"] ||
-            [combined containsString:@"can't reach"] ||
-            [combined containsString:@"general error"] ||
-            [combined containsString:@"try again later"] ||
+        if ([combined containsString:@"Oops"] || [combined containsString:@"can't reach"] ||
+            [combined containsString:@"general error"] || [combined containsString:@"try again later"] ||
             [combined containsString:@"Need more coin"]) {
-            
-            Log([NSString stringWithFormat:@"🚫 Swallowed: \"%@\"", title]);
-            // Fire the default action handler
+            Log([NSString stringWithFormat:@"🚫 Swallowed: \"%@\"", alert.title]);
             for (UIAlertAction *action in alert.actions) {
                 if (action.style == UIAlertActionStyleDefault || action.style == UIAlertActionStyleCancel) {
                     void (^handler)(UIAlertAction *) = [action valueForKey:@"handler"];
-                    if (handler) {
-                        handler(action);
-                        break;
-                    }
+                    if (handler) { handler(action); break; }
                 }
             }
             return;
@@ -200,7 +173,7 @@ static void hooked_presentVC(id self, SEL _cmd, UIViewController *vc, BOOL anima
 }
 
 // ─────────────────────────────────────────────────
-// 3. UserDefaults (unchanged)
+// 3. UserDefaults
 // ─────────────────────────────────────────────────
 
 static id (*orig_ud_object)(id, SEL, NSString*);
@@ -220,7 +193,7 @@ static void ForceWriteUD(void) {
 }
 
 // ─────────────────────────────────────────────────
-// 4. Realm (V18 precise writes, unchanged)
+// 4. Realm
 // ─────────────────────────────────────────────────
 
 static void PatchRealm(void) {
@@ -276,23 +249,20 @@ static void Init(void) {
     sDidInit = YES;
     Log(@"========== V20 — RESPONSE INTERCEPTION ==========");
     
-    // Hook dataTaskWithRequest:completionHandler: (catches response)
     Method respM = class_getInstanceMethod([NSURLSession class], @selector(dataTaskWithRequest:completionHandler:));
     if (respM) {
         orig_dataTaskWithReq_completion = (void*)method_getImplementation(respM);
         method_setImplementation(respM, (IMP)hooked_dataTaskWithReq_completion);
-        Log(@"✓ Response hook installed");
+        Log(@"✓ Response hook");
     }
     
-    // Alert suppression
     Method alertM = class_getInstanceMethod([UIViewController class], @selector(presentViewController:animated:completion:));
     if (alertM) {
         orig_presentVC = (void*)method_getImplementation(alertM);
         method_setImplementation(alertM, (IMP)hooked_presentVC);
-        Log(@"✓ Alert hook installed");
+        Log(@"✓ Alert hook");
     }
     
-    // UserDefaults
     Method udM = class_getInstanceMethod([NSUserDefaults class], @selector(objectForKey:));
     orig_ud_object = (void*)method_getImplementation(udM);
     method_setImplementation(udM, (IMP)hooked_ud_object);
@@ -305,6 +275,6 @@ static void Init(void) {
             ForceWriteUD();
             PatchRealm();
         }];
-        Log(@"✓ All systems running");
+        Log(@"✓ Running");
     });
 }
