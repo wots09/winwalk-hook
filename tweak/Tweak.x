@@ -19,71 +19,45 @@ static void WriteDiagnostic(NSString *msg) {
     }
 }
 
-static NSArray *FindRealmCoinClasses(void) {
-    NSMutableArray *found = [NSMutableArray array];
-    unsigned int count = 0;
-    Class *all = objc_copyClassList(&count);
-    for (unsigned int i = 0; i < count; i++) {
-        NSString *name = NSStringFromClass(all[i]);
-        if ([name hasPrefix:@"winwalk.Realm"]) {
-            [found addObject:name];
-        }
-    }
-    free(all);
-    return found;
-}
-
-static NSArray *FindCoinPropertyNames(Class cls) {
-    NSMutableArray *keys = [NSMutableArray array];
-    unsigned int propCount = 0;
-    objc_property_t *props = class_copyPropertyList(cls, &propCount);
-    for (unsigned int i = 0; i < propCount; i++) {
-        NSString *pname = [NSString stringWithUTF8String:property_getName(props[i])];
-        NSString *lower = pname.lowercaseString;
-        if ([lower containsString:@"coin"] || [lower containsString:@"step"] || 
-            [lower containsString:@"balance"] || [lower containsString:@"reward"]) {
-            [keys addObject:pname];
-        }
-    }
-    free(props);
-    return keys;
-}
-
 static void PatchRealmDB(void) {
-    WriteDiagnostic(@"─── Realm DB Patch Cycle ───");
-    
-    NSArray *realmClasses = FindRealmCoinClasses();
-    WriteDiagnostic([NSString stringWithFormat:@"Found %lu Realm classes: %@", 
-                     (unsigned long)realmClasses.count, realmClasses]);
+    WriteDiagnostic(@"─── Cycle ───");
     
     Class realmClass = NSClassFromString(@"RLMRealm");
-    if (!realmClass) {
-        WriteDiagnostic(@"FATAL: RLMRealm not found");
-        return;
-    }
+    if (!realmClass) { WriteDiagnostic(@"RLMRealm MISSING"); return; }
     
     id realm = ((id (*)(Class, SEL))objc_msgSend)(realmClass, sel_getUid("defaultRealm"));
-    if (!realm) {
-        WriteDiagnostic(@"FATAL: defaultRealm returned nil — DB not ready yet, will retry");
-        return;
-    }
-    WriteDiagnostic(@"Realm instance obtained ✓");
+    if (!realm) { WriteDiagnostic(@"defaultRealm=nil"); return; }
     
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("beginWriteTransaction"));
     
-    int totalPatched = 0;
+    // Every possible coin/step key — try all on every object
+    NSArray *allKeys = @[
+        @"coins", @"currentCoins", @"step", @"coinBalance",
+        @"coinValue", @"rewardCoins", @"remainingCoin",
+        @"currentStep", @"totalCoins", @"earnedCoins",
+        @"bonusCoins", @"dailyCoins", @"distance",
+        @"calories", @"activeTime"
+    ];
     
-    for (NSString *className in realmClasses) {
-        Class cls = NSClassFromString(className);
+    // All 9 Realm classes discovered in V4
+    NSArray *classNames = @[
+        @"winwalk.RealmChallengeItem",
+        @"winwalk.RealmRewardItem",
+        @"winwalk.RealmStreakChallengeItem",
+        @"winwalk.RealmDailyStepModel",
+        @"winwalk.RealmRewardShop",
+        @"winwalk.RealmGiftCardItemDetail",
+        @"winwalk.RealmGiftCardItem",
+        @"winwalk.RealmActor",
+        @"winwalk.RealmConfiguration"
+    ];
+    
+    int totalObjects = 0;
+    int totalSetters = 0;
+    
+    for (NSString *cn in classNames) {
+        Class cls = NSClassFromString(cn);
         if (!cls) continue;
-        
-        NSArray *coinProps = FindCoinPropertyNames(cls);
-        if (coinProps.count == 0) {
-            WriteDiagnostic([NSString stringWithFormat:@"  %@ — no coin properties", className]);
-            continue;
-        }
-        
-        WriteDiagnostic([NSString stringWithFormat:@"  %@ coin props: %@", className, coinProps]);
         
         id results = ((id (*)(Class, SEL, id))objc_msgSend)(cls, sel_getUid("allObjectsInRealm:"), realm);
         if (!results) continue;
@@ -92,31 +66,44 @@ static void PatchRealmDB(void) {
         if (!enumerator) continue;
         
         int objCount = 0;
+        int keyHits = 0;
+        NSMutableString *hitKeys = [NSMutableString string];
+        BOOL firstObj = YES;
+        
         id obj;
         while ((obj = ((id (*)(id, SEL))objc_msgSend)(enumerator, sel_getUid("nextObject")))) {
-            for (NSString *key in coinProps) {
+            for (NSString *key in allKeys) {
                 NSNumber *val = @(kInjectedCoins);
                 if ([key.lowercaseString containsString:@"step"]) val = @99999900;
+                
+                // Try setting — KVC throws if key doesn't exist
                 @try {
                     ((void (*)(id, SEL, id, id))objc_msgSend)(obj, sel_getUid("setValue:forKey:"), val, key);
+                    keyHits++;
+                    if (firstObj) [hitKeys appendFormat:@" %@", key];
                 } @catch (id e) {
-                    WriteDiagnostic([NSString stringWithFormat:@"    ERROR %@.%@: %@", className, key, e]);
+                    // Key doesn't exist on this class — expected for most
                 }
             }
+            firstObj = NO;
             objCount++;
         }
-        totalPatched += objCount;
-        WriteDiagnostic([NSString stringWithFormat:@"  %@: patched %d objects", className, objCount]);
+        
+        if (objCount > 0) {
+            totalObjects += objCount;
+            totalSetters += keyHits;
+            WriteDiagnostic([NSString stringWithFormat:@"  %@: %d objs, %d sets, keys=%@",
+                             cn, objCount, keyHits, hitKeys.length ? hitKeys : @"(none)"]);
+        }
     }
     
     ((void (*)(id, SEL))objc_msgSend)(realm, sel_getUid("commitWriteTransaction"));
-    WriteDiagnostic([NSString stringWithFormat:@"TOTAL: %d objects patched", totalPatched]);
+    WriteDiagnostic([NSString stringWithFormat:@"TOTAL: %d objects, %d values written", totalObjects, totalSetters]);
 }
 
 __attribute__((constructor))
 static void WinwalkHackInit(void) {
-    WriteDiagnostic(@"========== WINWALK HACK V4 — REALM DB PATCHER ==========");
-    WriteDiagnostic([NSString stringWithFormat:@"Target coins=%ld", (long)kInjectedCoins]);
+    WriteDiagnostic(@"========== V5 — BRUTE FORCE KVC ==========");
     
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                    dispatch_get_main_queue(), ^{
@@ -125,6 +112,4 @@ static void WinwalkHackInit(void) {
             PatchRealmDB();
         }];
     });
-    
-    WriteDiagnostic(@"Init done — patcher fires at T+5s");
 }
